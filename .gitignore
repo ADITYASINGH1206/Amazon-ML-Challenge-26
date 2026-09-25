@@ -1,0 +1,32 @@
+# Challenge-provided resources
+6ab10eb3b23ba_student_resource/
+__MACOSX/
+.DS_Store
+
+# Python
+venv/
+.venv/
+env/
+.env
+__pycache__/
+*.pyc
+
+# Datasets
+*.csv
+*.tsv
+*.parquet
+*.pkl
+*.npy
+
+# Generated files
+workdir/
+output/
+embeddings/
+models/
+preprocessed/
+blocking/
+features/
+
+# IDE
+.vscode/
+.idea/

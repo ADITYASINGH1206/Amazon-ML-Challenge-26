@@ -1,0 +1,21 @@
+# Amazon ML Challenge 2026 - Business Entity Resolution
+# Python 3.10+
+
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+lightgbm>=4.0.0
+rapidfuzz>=3.5.0
+sentence-transformers>=2.2.0
+transformers>=4.36.0
+torch>=2.1.0
+faiss-cpu>=1.7.4
+# For GPU FAISS (recommended): pip install faiss-gpu-cu12
+jellyfish>=1.0.0
+tqdm>=4.65.0
+pyarrow>=14.0.0
+joblib>=1.3.0
+
+psutil>=5.9.0
+
+sentencepiece>=0.1.99
