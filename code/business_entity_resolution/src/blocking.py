@@ -218,38 +218,39 @@ def tfidf_blocking_by_country(
         tfidf_targets = vectorizer.fit_transform(t_texts)
         log.info(f"    Target TF-IDF shape: {tfidf_targets.shape}")
 
-        t_eids = t_df["entity_id"].values
-
-        # Process queries in batches
-        for start in tqdm(range(0, len(q_df), batch_size),
-                          desc=f"  TF-IDF {country}", mininterval=5):
-            end = min(start + batch_size, len(q_df))
-            batch_texts = q_texts[start:end]
-            batch_eids = q_df["entity_id"].values[start:end]
-
-            tfidf_batch = vectorizer.transform(batch_texts)
-
-            # Dense cosine similarity (fits in RAM because batch_size is small)
-            sim = cosine_similarity(tfidf_batch, tfidf_targets, dense_output=True)
-
-            # Extract top-k per query
-            for i in range(sim.shape[0]):
-                row_data = sim[i]
-                q_eid = batch_eids[i]
-
-                if q_eid not in candidates:
-                    candidates[q_eid] = set()
-
-                if len(row_data) <= top_k:
-                    top_indices = np.arange(len(row_data))
-                else:
-                    top_indices = np.argpartition(row_data, -top_k)[-top_k:]
-
-                for ti in top_indices:
-                    if row_data[ti] > 0:  # Only add if there is some similarity
-                        candidates[q_eid].add(t_eids[ti])
-
-        del tfidf_targets, vectorizer
+        # Use sparse_dot_topn for massive speedup and zero OOM risk
+        from sparse_dot_topn import sp_matmul_topn
+        
+        tfidf_queries = vectorizer.transform(q_texts)
+        
+        log.info(f"    Computing sparse dot product (top_{top_k})...")
+        # Ensure CSR format for fast C++ processing
+        A = tfidf_queries.tocsr()
+        B_T = tfidf_targets.transpose().tocsr()
+        
+        # This executes in C++, keeps only top_k per row, and never instantiates the dense matrix!
+        sim_sparse = sp_matmul_topn(A, B_T, top_n=top_k)
+        
+        q_eids = q_df["entity_id"].values
+        
+        log.info("    Extracting candidates...")
+        # sim_sparse is a CSR matrix
+        for i in range(sim_sparse.shape[0]):
+            q_eid = q_eids[i]
+            if q_eid not in candidates:
+                candidates[q_eid] = set()
+                
+            # CSR format: indices for row i are stored in indices[indptr[i]:indptr[i+1]]
+            start_idx = sim_sparse.indptr[i]
+            end_idx = sim_sparse.indptr[i+1]
+            
+            for ptr in range(start_idx, end_idx):
+                ti = sim_sparse.indices[ptr]
+                score = sim_sparse.data[ptr]
+                if score > 0:
+                    candidates[q_eid].add(t_eids[ti])
+                    
+        del tfidf_targets, tfidf_queries, sim_sparse, vectorizer
         gc.collect()
 
     return candidates
