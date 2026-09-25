@@ -176,12 +176,12 @@ def tfidf_blocking_by_country(
     df_queries: pd.DataFrame,
     df_targets: pd.DataFrame,
     top_k: int = 30,
-    batch_size: int = 5000,
+    batch_size: int = 100,
 ) -> Dict[str, Set[str]]:
     """
     TF-IDF character n-gram blocking, processed per-country partition.
 
-    Uses sparse matrix multiplication in batches to find top-k similar targets.
+    Uses dense matrix multiplication in tiny batches to prevent OOM.
     """
     from sklearn.metrics.pairwise import cosine_similarity
 
@@ -229,30 +229,25 @@ def tfidf_blocking_by_country(
 
             tfidf_batch = vectorizer.transform(batch_texts)
 
-            # Sparse cosine similarity
-            sim = cosine_similarity(tfidf_batch, tfidf_targets, dense_output=False)
+            # Dense cosine similarity (fits in RAM because batch_size is small)
+            sim = cosine_similarity(tfidf_batch, tfidf_targets, dense_output=True)
 
             # Extract top-k per query
             for i in range(sim.shape[0]):
-                row = sim.getrow(i)
-                if row.nnz == 0:
-                    candidates[batch_eids[i]] = candidates.get(batch_eids[i], set())
-                    continue
-
-                data = row.data
-                indices = row.indices
-
-                if len(data) <= top_k:
-                    top_indices = indices
-                else:
-                    top_pos = np.argpartition(data, -top_k)[-top_k:]
-                    top_indices = indices[top_pos]
-
+                row_data = sim[i]
                 q_eid = batch_eids[i]
+
                 if q_eid not in candidates:
                     candidates[q_eid] = set()
+
+                if len(row_data) <= top_k:
+                    top_indices = np.arange(len(row_data))
+                else:
+                    top_indices = np.argpartition(row_data, -top_k)[-top_k:]
+
                 for ti in top_indices:
-                    candidates[q_eid].add(t_eids[ti])
+                    if row_data[ti] > 0:  # Only add if there is some similarity
+                        candidates[q_eid].add(t_eids[ti])
 
         del tfidf_targets, vectorizer
         gc.collect()
