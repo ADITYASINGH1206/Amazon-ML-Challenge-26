@@ -95,17 +95,13 @@ def _get_blocking_keys(name_tokens: list, addr_tokens: list,
     return keys
 
 
-@timed
-def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
-    """
-    Build an inverted index: blocking_key → list of target DataFrame indices.
-    """
-    index = defaultdict(list)
-    max_bucket = config.TOKEN_MAX_DF
+import os
+import concurrent.futures
 
-    for idx in tqdm(range(len(df_targets)), desc="Building inverted index",
-                    mininterval=10):
-        row = df_targets.iloc[idx]
+def _build_index_chunk(df_chunk: pd.DataFrame, start_idx: int) -> Dict[str, List[int]]:
+    index = defaultdict(list)
+    for i in range(len(df_chunk)):
+        row = df_chunk.iloc[i]
         name_tokens = row["name_tokens"] if isinstance(row["name_tokens"], list) else []
         addr_tokens = row["addr_tokens"] if isinstance(row["addr_tokens"], list) else []
         postal = str(row.get("postal", "")) if pd.notna(row.get("postal", "")) else ""
@@ -113,17 +109,42 @@ def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
 
         keys = _get_blocking_keys(name_tokens, addr_tokens, postal, country)
         for key in keys:
-            index[key].append(idx)
+            index[key].append(start_idx + i)
+    return dict(index)
+
+@timed
+def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
+    """
+    Build an inverted index: blocking_key → list of target DataFrame indices.
+    """
+    max_bucket = config.TOKEN_MAX_DF
+    n_workers = os.cpu_count() or 4
+    chunk_size = max(1, len(df_targets) // n_workers)
+    
+    chunks = []
+    for i in range(0, len(df_targets), chunk_size):
+        chunks.append((df_targets.iloc[i:i+chunk_size], i))
+        
+    global_index = defaultdict(list)
+    
+    log.info(f"  Building inverted index using {n_workers} processes in {len(chunks)} chunks...")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = [executor.submit(_build_index_chunk, chunk, start) for chunk, start in chunks]
+        
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Merging index chunks"):
+            partial_idx = future.result()
+            for key, val in partial_idx.items():
+                global_index[key].extend(val)
 
     # Prune overly common keys
     pruned = 0
-    for key in list(index.keys()):
-        if len(index[key]) > max_bucket:
-            del index[key]
+    for key in list(global_index.keys()):
+        if len(global_index[key]) > max_bucket:
+            del global_index[key]
             pruned += 1
 
-    log.info(f"  Inverted index: {len(index):,} keys, {pruned:,} pruned (>{max_bucket})")
-    return dict(index)
+    log.info(f"  Inverted index: {len(global_index):,} keys, {pruned:,} pruned (>{max_bucket})")
+    return dict(global_index)
 
 
 def query_inverted_index(df_queries: pd.DataFrame,
