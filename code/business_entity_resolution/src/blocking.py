@@ -355,8 +355,8 @@ def dense_blocking_by_country(
 
     import torch
 
-    target_cache = 'output/target_embeddings.npy'
-    query_cache = 'output/query_embeddings.npy'
+    target_cache = f'output/target_embeddings_{split}.npy'
+    query_cache = f'output/query_embeddings_{split}.npy'
 
     if os.path.exists(target_cache) and os.path.exists(query_cache):
         log.info("  Loading global embeddings from cache...")
@@ -523,7 +523,7 @@ def run_blocking(split: str = "train",
         log.info(f"  Saved to {save_path.name}")
         
         # Output TSV for candidates
-        tsv_path = Path("output/candidate_pairs.tsv")
+        tsv_path = Path(f"output/candidate_pairs_{split}.tsv")
         tsv_path.parent.mkdir(exist_ok=True, parents=True)
         with open(tsv_path, "w", encoding="utf-8") as f:
             f.write("source1_entity_id\tcandidate_entity_ids\n")
