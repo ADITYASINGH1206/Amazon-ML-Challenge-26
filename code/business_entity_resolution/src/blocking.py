@@ -11,6 +11,11 @@ All strategies are partitioned by country to reduce search space.
 The union of all candidates becomes the final blocking set.
 """
 
+import os
+import joblib
+
+os.makedirs('output', exist_ok=True)
+
 import gc
 import pickle
 import numpy as np
@@ -347,11 +352,26 @@ def dense_blocking_by_country(
 
     import torch
 
+    target_cache = 'output/target_embeddings.npy'
+    query_cache = 'output/query_embeddings.npy'
+
+    if os.path.exists(target_cache) and os.path.exists(query_cache):
+        log.info("  Loading global embeddings from cache...")
+        global_emb_targets = np.load(target_cache)
+        global_emb_queries = np.load(query_cache)
+    else:
+        log.info("  Computing global embeddings...")
+        t_texts = df_targets["name_addr"].fillna("").values
+        q_texts = df_queries["name_addr"].fillna("").values
+
+        global_emb_targets = compute_embeddings(t_texts, save_path=Path(target_cache))
+        global_emb_queries = compute_embeddings(q_texts, save_path=Path(query_cache))
+
     candidates = {}
     countries = df_queries["country_clean"].unique()
 
     for country in countries:
-        log.info(f"  FAISS blocking for country: {country}")
+        log.info(f"  Dense blocking for country: {country}")
 
         q_mask = df_queries["country_clean"] == country
         t_mask = df_targets["country_clean"] == country
@@ -364,20 +384,8 @@ def dense_blocking_by_country(
 
         log.info(f"    Queries: {len(q_df):,}, Targets: {len(t_df):,}")
 
-        # Try to load cached embeddings
-        emb_q_path = config.EMBEDDINGS_DIR / f"emb_query_{country}.npy"
-        emb_t_path = config.EMBEDDINGS_DIR / f"emb_target_{country}.npy"
-
-        if emb_q_path.exists() and emb_t_path.exists():
-            log.info("    Loading cached embeddings...")
-            emb_queries = np.load(emb_q_path)
-            emb_targets = np.load(emb_t_path)
-        else:
-            q_texts = q_df["name_addr"].fillna("").values
-            t_texts = t_df["name_addr"].fillna("").values
-
-            emb_targets = compute_embeddings(t_texts, save_path=emb_t_path)
-            emb_queries = compute_embeddings(q_texts, save_path=emb_q_path)
+        emb_targets = global_emb_targets[t_mask]
+        emb_queries = global_emb_queries[q_mask]
 
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
