@@ -496,6 +496,16 @@ def run_blocking(split: str = "train",
         with open(save_path, "wb") as f:
             pickle.dump(final_candidates, f, protocol=pickle.HIGHEST_PROTOCOL)
         log.info(f"  Saved to {save_path.name}")
+        
+        # Output TSV for candidates
+        tsv_path = Path("output/candidate_pairs.tsv")
+        tsv_path.parent.mkdir(exist_ok=True, parents=True)
+        with open(tsv_path, "w", encoding="utf-8") as f:
+            f.write("source1_entity_id\tcandidate_entity_ids\n")
+            for q_eid, c_eids in final_candidates.items():
+                c_str = str(list(c_eids))
+                f.write(f"{q_eid}\t{c_str}\n")
+        log.info(f"  Saved TSV to {tsv_path}")
 
     return final_candidates
 
