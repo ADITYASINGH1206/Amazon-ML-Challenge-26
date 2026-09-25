@@ -113,6 +113,11 @@ def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
     """
     Build an inverted index: blocking_key → list of target DataFrame indices.
     """
+    cache_path = "output/inverted_index.joblib"
+    if os.path.exists(cache_path):
+        log.info("  Loading inverted index from cache...")
+        return joblib.load(cache_path)
+
     max_bucket = config.TOKEN_MAX_DF
     n_workers = os.cpu_count() or 4
     chunk_size = max(1, len(df_targets) // n_workers)
@@ -144,8 +149,10 @@ def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
             del global_index[key]
             pruned += 1
 
-    log.info(f"  Inverted index: {len(global_index):,} keys, {pruned:,} pruned (>{max_bucket})")
-    return dict(global_index)
+    final_index = dict(global_index)
+    joblib.dump(final_index, cache_path)
+    log.info(f"  Inverted index: {len(final_index):,} keys, {pruned:,} pruned (>{max_bucket})")
+    return final_index
 
 
 def query_inverted_index(df_queries: pd.DataFrame,
@@ -292,8 +299,11 @@ def compute_embeddings(texts: np.ndarray, model_name: str = None,
     """
     Compute sentence embeddings using a multilingual model.
 
-    Embeddings are L2-normalized for cosine similarity via inner product.
     """
+    if save_path is not None and Path(save_path).exists():
+        log.info(f"  Loading embeddings from {save_path}...")
+        return np.load(save_path)
+
     from sentence_transformers import SentenceTransformer
 
     if model_name is None:
@@ -381,31 +391,41 @@ def faiss_blocking_by_country(
         dim = emb_targets.shape[1]
         n_targets = len(emb_targets)
 
-        # Build FAISS index
-        log.info(f"    Building FAISS IVF index (dim={dim}, n={n_targets:,})...")
-        nlist = min(config.FAISS_NLIST, n_targets // 40)
-        nlist = max(nlist, 1)
+        # Build or Load FAISS index
+        index_path = config.EMBEDDINGS_DIR / f"faiss_index_{country}.bin"
+        if index_path.exists():
+            log.info(f"    Loading cached FAISS index from {index_path}...")
+            cpu_index = faiss.read_index(str(index_path))
+        else:
+            log.info(f"    Building FAISS IVF index (dim={dim}, n={n_targets:,})...")
+            nlist = min(config.FAISS_NLIST, n_targets // 40)
+            nlist = max(nlist, 1)
 
-        quantizer = faiss.IndexFlatIP(dim)
-        index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
+            quantizer = faiss.IndexFlatIP(dim)
+            cpu_index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
+            
+            # Train and add
+            train_subset = emb_targets[:min(500_000, n_targets)]
+            cpu_index.train(train_subset)
+            cpu_index.add(emb_targets)
+            
+            log.info(f"    Saving FAISS index to {index_path}...")
+            faiss.write_index(cpu_index, str(index_path))
 
         # Use GPU if available
         use_gpu = torch.cuda.is_available()
         if use_gpu:
             try:
                 res = faiss.StandardGpuResources()
-                index = faiss.index_cpu_to_gpu(res, 0, index)
+                index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
                 log.info("    Using FAISS GPU index")
             except Exception as e:
                 log.warning(f"    GPU FAISS failed ({e}), using CPU")
                 use_gpu = False
-                index = faiss.IndexIVFFlat(quantizer, dim, nlist,
-                                           faiss.METRIC_INNER_PRODUCT)
-
-        # Train and add
-        train_subset = emb_targets[:min(500_000, n_targets)]
-        index.train(train_subset)
-        index.add(emb_targets)
+                index = cpu_index
+        else:
+            index = cpu_index
+            
         index.nprobe = config.FAISS_NPROBE
 
         # Search in batches
