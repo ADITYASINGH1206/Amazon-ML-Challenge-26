@@ -58,6 +58,11 @@ def stage_features():
 
     # Training features
     log.info("═══ Extracting TRAINING features ═══")
+    out_path = config.FEATURES_DIR / "train_features.parquet"
+    if out_path.exists():
+        log.info(f"Training features already exist at {out_path}. Skipping.")
+        return
+
     candidates = load_candidates("train")
     df_s1 = load_preprocessed("train", "s1")
     df_s2 = load_preprocessed("train", "s2")

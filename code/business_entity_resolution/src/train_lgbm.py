@@ -208,6 +208,11 @@ def load_lgbm_model() -> lgb.LGBMClassifier:
 @timed
 def run_lgbm_training():
     """Full LightGBM training pipeline."""
+    model_path = config.MODELS_DIR / "lgbm_model.pkl"
+    if model_path.exists():
+        log.info(f"LightGBM model already exists at {model_path}. Skipping training.")
+        return load_lgbm_model()
+
     # Load features
     features_path = config.FEATURES_DIR / "train_features.parquet"
     log.info(f"Loading features from {features_path.name}...")

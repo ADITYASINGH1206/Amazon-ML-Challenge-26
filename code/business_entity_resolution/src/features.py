@@ -435,48 +435,19 @@ def load_embeddings_for_features(split: str, df_s1: pd.DataFrame,
 
     Returns: (emb_s1, emb_targets, s1_eid_to_idx, target_eid_to_idx)
     """
-    countries = df_s1["country_clean"].unique()
+    import os
+    target_cache = f'output/target_embeddings_{split}.npy'
+    query_cache = f'output/query_embeddings_{split}.npy'
 
-    # Collect per-country embeddings
-    emb_s1_parts = []
-    emb_t_parts = []
-    s1_eid_to_idx = {}
-    target_eid_to_idx = {}
+    if not os.path.exists(target_cache) or not os.path.exists(query_cache):
+        log.warning(f"Global embeddings for {split} not found!")
+        return None, None, {}, {}
 
-    global_s1_idx = 0
-    global_t_idx = 0
+    emb_s1 = np.load(query_cache)
+    emb_targets = np.load(target_cache)
 
-    for country in countries:
-        emb_q_path = config.EMBEDDINGS_DIR / f"emb_query_{country}.npy"
-        emb_t_path = config.EMBEDDINGS_DIR / f"emb_target_{country}.npy"
-
-        if not emb_q_path.exists() or not emb_t_path.exists():
-            log.warning(f"  Embeddings for {country} not found, skipping")
-            continue
-
-        emb_q = np.load(emb_q_path)
-        emb_t = np.load(emb_t_path)
-
-        # Map entity IDs to indices
-        q_mask = df_s1["country_clean"] == country
-        t_mask = df_targets["country_clean"] == country
-
-        q_eids = df_s1[q_mask]["entity_id"].values
-        t_eids = df_targets[t_mask]["entity_id"].values
-
-        for i, eid in enumerate(q_eids):
-            s1_eid_to_idx[eid] = global_s1_idx + i
-        for i, eid in enumerate(t_eids):
-            target_eid_to_idx[eid] = global_t_idx + i
-
-        emb_s1_parts.append(emb_q)
-        emb_t_parts.append(emb_t)
-
-        global_s1_idx += len(emb_q)
-        global_t_idx += len(emb_t)
-
-    emb_s1 = np.vstack(emb_s1_parts) if emb_s1_parts else None
-    emb_targets = np.vstack(emb_t_parts) if emb_t_parts else None
+    s1_eid_to_idx = {eid: idx for idx, eid in enumerate(df_s1["entity_id"].values)}
+    target_eid_to_idx = {eid: idx for idx, eid in enumerate(df_targets["entity_id"].values)}
 
     return emb_s1, emb_targets, s1_eid_to_idx, target_eid_to_idx
 
