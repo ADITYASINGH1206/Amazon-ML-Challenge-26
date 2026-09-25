@@ -454,15 +454,8 @@ def run_blocking(split: str = "train",
              f"{sum(len(v) for v in cands_inv.values()):,} pairs")
     log_memory()
 
-    # ── Strategy 2: TF-IDF Blocking ─────────────────────────
-    log.info("═══ Strategy 2: TF-IDF Character N-gram Blocking ═══")
-    cands_tfidf = tfidf_blocking_by_country(df_s1, df_targets, top_k=20)
-    log.info(f"  TF-IDF candidates: "
-             f"{sum(len(v) for v in cands_tfidf.values()):,} pairs")
-    log_memory()
-
-    # ── Strategy 3: FAISS Dense Blocking ────────────────────
-    log.info("═══ Strategy 3: FAISS Dense Blocking ═══")
+    # ── Strategy 2: FAISS Dense Blocking ────────────────────
+    log.info("═══ Strategy 2: FAISS Dense Blocking ═══")
     cands_faiss = faiss_blocking_by_country(df_s1, df_targets, top_k=config.FAISS_TOP_K)
     log.info(f"  FAISS candidates: "
              f"{sum(len(v) for v in cands_faiss.values()):,} pairs")
@@ -476,7 +469,6 @@ def run_blocking(split: str = "train",
     for s1_eid in tqdm(all_s1_eids, desc="Merging candidates", mininterval=10):
         merged = set()
         merged.update(cands_inv.get(s1_eid, set()))
-        merged.update(cands_tfidf.get(s1_eid, set()))
         merged.update(cands_faiss.get(s1_eid, set()))
 
         # Cap at max candidates (keep all if under limit)
