@@ -441,6 +441,12 @@ def run_blocking(split: str = "train",
 
     Returns: {s1_entity_id: set(candidate_entity_ids)}
     """
+    save_path = config.BLOCKING_DIR / f"{split}_candidates.pkl"
+    if save_path.exists():
+        log.info(f"Loading existing final candidates for {split} from {save_path.name}...")
+        with open(save_path, "rb") as f:
+            return pickle.load(f)
+
     # Load preprocessed data
     log.info(f"Loading preprocessed {split} data...")
     df_s1 = load_preprocessed(split, "s1")
