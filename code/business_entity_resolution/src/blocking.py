@@ -395,7 +395,7 @@ def dense_blocking_by_country(
         t_eids = t_df["entity_id"].values
         q_eids = q_df["entity_id"].values
 
-        search_batch = 5000
+        search_batch = 500
         for start in tqdm(range(0, len(emb_queries), search_batch),
                           desc=f"  Dense search {country}", mininterval=5):
             end = min(start + search_batch, len(emb_queries))
