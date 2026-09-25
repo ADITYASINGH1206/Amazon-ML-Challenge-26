@@ -1,0 +1,10 @@
+pandas
+numpy
+scikit-learn
+lightgbm
+catboost
+xgboost
+rapidfuzz
+tqdm
+joblib
+scipy

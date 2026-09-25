@@ -1,32 +1,12 @@
-# Challenge-provided resources
-6ab10eb3b23ba_student_resource/
-__MACOSX/
-.DS_Store
-
-# Python
-venv/
-.venv/
-env/
-.env
 __pycache__/
 *.pyc
-
-# Datasets
-*.csv
-*.tsv
-*.parquet
-*.pkl
-*.npy
-
-# Generated files
-workdir/
+.ipynb_checkpoints/
 output/
-embeddings/
+dataset/
 models/
-preprocessed/
-blocking/
-features/
-
-# IDE
-.vscode/
-.idea/
+.venv/
+venv/
+catboost_info/
+student_resource/
+*.zip
+.DS_Store
