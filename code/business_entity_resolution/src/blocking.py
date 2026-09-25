@@ -112,11 +112,11 @@ def _build_index_chunk(df_chunk: pd.DataFrame, start_idx: int, temp_dir: str) ->
     return file_path
 
 @timed
-def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
+def build_inverted_index(df_targets: pd.DataFrame, split: str = "train") -> Dict[str, List[int]]:
     """
     Build an inverted index: blocking_key → list of target DataFrame indices.
     """
-    cache_path = "output/inverted_index.joblib"
+    cache_path = f"output/inverted_index_{split}.joblib"
     if os.path.exists(cache_path):
         log.info("  Loading inverted index from cache...")
         return joblib.load(cache_path)
@@ -168,6 +168,7 @@ def query_inverted_index(df_queries: pd.DataFrame,
     Returns: {query_entity_id: set(target_entity_ids)}
     """
     candidates = {}
+    target_eids_arr = np.array(target_entity_ids)
 
     for idx in tqdm(range(len(df_queries)), desc="Querying inverted index",
                     mininterval=10):
@@ -192,7 +193,8 @@ def query_inverted_index(df_queries: pd.DataFrame,
         cand_eids = set()
         for target_idx, count in top:
             if count >= config.MIN_SHARED_TOKENS:
-                cand_eids.add(target_entity_ids[target_idx])
+                if target_idx < len(target_eids_arr):
+                    cand_eids.add(target_eids_arr[target_idx])
 
         candidates[q_eid] = cand_eids
 
@@ -453,7 +455,7 @@ def run_blocking(split: str = "train",
 
     # ── Strategy 1: Inverted Index ──────────────────────────
     log.info("═══ Strategy 1: Inverted Index Blocking ═══")
-    inv_index = build_inverted_index(df_targets)
+    inv_index = build_inverted_index(df_targets, split=split)
     cands_inv = query_inverted_index(
         df_s1, inv_index, target_eids,
         max_candidates=config.MAX_CANDIDATES_PER_ENTITY
