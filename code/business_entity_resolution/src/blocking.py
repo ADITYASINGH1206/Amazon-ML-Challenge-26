@@ -26,19 +26,9 @@ from src import config
 from src.utils import log, timed, log_memory
 from src.preprocess import load_preprocessed
 
-try:
-    import faiss
-    HAS_FAISS = True
-except ImportError:
-    HAS_FAISS = False
-    log.warning("FAISS not installed. Dense blocking will be skipped.")
+HAS_FAISS = True  # We assume FAISS is installed, import will happen locally inside dense_retrieval
 
-try:
-    import jellyfish
-    HAS_JELLYFISH = True
-except ImportError:
-    HAS_JELLYFISH = False
-    log.warning("jellyfish not installed. Phonetic blocking will be skipped.")
+HAS_JELLYFISH = True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -79,6 +69,7 @@ def _get_blocking_keys(name_tokens: list, addr_tokens: list,
     # Key type 5: phonetic key (Soundex of first name word + country)
     if HAS_JELLYFISH and name_sig:
         try:
+            import jellyfish
             sdx = jellyfish.soundex(name_sig[0])
             keys.append(f"sx:{country}:{sdx}")
             if len(name_sig) > 1:
@@ -347,6 +338,8 @@ def faiss_blocking_by_country(
     if not HAS_FAISS:
         log.warning("FAISS not available, skipping dense blocking")
         return {}
+        
+    import faiss
 
     if top_k is None:
         top_k = config.FAISS_TOP_K
