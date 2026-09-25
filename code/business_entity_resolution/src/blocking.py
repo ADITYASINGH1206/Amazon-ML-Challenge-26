@@ -5,7 +5,7 @@ Combines four blocking strategies to achieve >95% recall:
 1. Composite-key inverted index (city + name prefix, postal code, etc.)
 2. Character n-gram TF-IDF sparse retrieval
 3. Phonetic (Soundex) key blocking
-4. Dense FAISS ANN retrieval (multilingual embeddings)
+4. Dense PyTorch ANN retrieval (multilingual embeddings)
 
 All strategies are partitioned by country to reduce search space.
 The union of all candidates becomes the final blocking set.
@@ -25,8 +25,6 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from src import config
 from src.utils import log, timed, log_memory
 from src.preprocess import load_preprocessed
-
-HAS_FAISS = True  # We assume FAISS is installed, import will happen locally inside dense_retrieval
 
 HAS_JELLYFISH = True
 
@@ -289,7 +287,7 @@ def tfidf_blocking_by_country(
 
 
 # ─────────────────────────────────────────────────────────────
-# STRATEGY 3: DENSE FAISS ANN RETRIEVAL
+# STRATEGY 3: DENSE PYTORCH ANN RETRIEVAL
 # ─────────────────────────────────────────────────────────────
 
 @timed
@@ -335,21 +333,14 @@ def compute_embeddings(texts: np.ndarray, model_name: str = None,
 
 
 @timed
-def faiss_blocking_by_country(
+def dense_blocking_by_country(
     df_queries: pd.DataFrame,
     df_targets: pd.DataFrame,
     top_k: int = None,
 ) -> Dict[str, Set[str]]:
     """
-    Dense FAISS ANN retrieval per country partition.
-
-    Uses multilingual sentence-transformer embeddings indexed with FAISS IVF.
+    Dense retrieval per country partition using native PyTorch matrix multiplication.
     """
-    if not HAS_FAISS:
-        log.warning("FAISS not available, skipping dense blocking")
-        return {}
-        
-    import faiss
 
     if top_k is None:
         top_k = config.FAISS_TOP_K
@@ -388,72 +379,40 @@ def faiss_blocking_by_country(
             emb_targets = compute_embeddings(t_texts, save_path=emb_t_path)
             emb_queries = compute_embeddings(q_texts, save_path=emb_q_path)
 
-        dim = emb_targets.shape[1]
-        n_targets = len(emb_targets)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        log.info(f"    Moving target embeddings to {device}...")
+        target_tensor = torch.tensor(emb_targets, dtype=torch.float16, device=device)
 
-        # Build or Load FAISS index
-        index_path = config.EMBEDDINGS_DIR / f"faiss_index_{country}.bin"
-        if index_path.exists():
-            log.info(f"    Loading cached FAISS index from {index_path}...")
-            cpu_index = faiss.read_index(str(index_path))
-        else:
-            log.info(f"    Building FAISS IVF index (dim={dim}, n={n_targets:,})...")
-            nlist = min(config.FAISS_NLIST, n_targets // 40)
-            nlist = max(nlist, 1)
-
-            quantizer = faiss.IndexFlatIP(dim)
-            cpu_index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
-            
-            # Train and add
-            train_subset = emb_targets[:min(500_000, n_targets)]
-            cpu_index.train(train_subset)
-            cpu_index.add(emb_targets)
-            
-            log.info(f"    Saving FAISS index to {index_path}...")
-            faiss.write_index(cpu_index, str(index_path))
-
-        # Use GPU if available
-        use_gpu = torch.cuda.is_available()
-        if use_gpu:
-            try:
-                res = faiss.StandardGpuResources()
-                index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
-                log.info("    Using FAISS GPU index")
-            except Exception as e:
-                log.warning(f"    GPU FAISS failed ({e}), using CPU")
-                use_gpu = False
-                index = cpu_index
-        else:
-            index = cpu_index
-            
-        index.nprobe = config.FAISS_NPROBE
-
-        # Search in batches
         t_eids = t_df["entity_id"].values
         q_eids = q_df["entity_id"].values
 
-        search_batch = 10_000
+        search_batch = 5000
         for start in tqdm(range(0, len(emb_queries), search_batch),
-                          desc=f"  FAISS search {country}", mininterval=5):
+                          desc=f"  Dense search {country}", mininterval=5):
             end = min(start + search_batch, len(emb_queries))
             batch_q = emb_queries[start:end]
 
-            scores, indices = index.search(batch_q, top_k)
+            query_tensor = torch.tensor(batch_q, dtype=torch.float16, device=device)
+            sim_matrix = torch.matmul(query_tensor, target_tensor.T)
+
+            k = min(top_k, sim_matrix.shape[1])
+            scores, indices = torch.topk(sim_matrix, k=k, dim=1)
+            indices_np = indices.cpu().numpy()
 
             for i in range(len(batch_q)):
                 q_eid = q_eids[start + i]
                 if q_eid not in candidates:
                     candidates[q_eid] = set()
 
-                for j in range(top_k):
-                    t_idx = indices[i, j]
-                    if t_idx >= 0:  # FAISS returns -1 for missing neighbors
-                        candidates[q_eid].add(t_eids[t_idx])
+                for j in range(k):
+                    t_idx = indices_np[i, j]
+                    candidates[q_eid].add(t_eids[t_idx])
 
         # Cleanup
-        del index, emb_targets, emb_queries
+        del target_tensor, emb_targets, emb_queries
         gc.collect()
-        if use_gpu:
+        if device == 'cuda':
             torch.cuda.empty_cache()
 
     return candidates
@@ -497,11 +456,11 @@ def run_blocking(split: str = "train",
              f"{sum(len(v) for v in cands_inv.values()):,} pairs")
     log_memory()
 
-    # ── Strategy 2: FAISS Dense Blocking ────────────────────
-    log.info("═══ Strategy 2: FAISS Dense Blocking ═══")
-    cands_faiss = faiss_blocking_by_country(df_s1, df_targets, top_k=config.FAISS_TOP_K)
-    log.info(f"  FAISS candidates: "
-             f"{sum(len(v) for v in cands_faiss.values()):,} pairs")
+    # ── Strategy 2: PyTorch Dense Blocking ────────────────────
+    log.info("═══ Strategy 2: PyTorch Dense Blocking ═══")
+    cands_dense = dense_blocking_by_country(df_s1, df_targets, top_k=config.FAISS_TOP_K)
+    log.info(f"  Dense candidates: "
+             f"{sum(len(v) for v in cands_dense.values()):,} pairs")
     log_memory()
 
     # ── Union all strategies ────────────────────────────────
@@ -512,7 +471,7 @@ def run_blocking(split: str = "train",
     for s1_eid in tqdm(all_s1_eids, desc="Merging candidates", mininterval=10):
         merged = set()
         merged.update(cands_inv.get(s1_eid, set()))
-        merged.update(cands_faiss.get(s1_eid, set()))
+        merged.update(cands_dense.get(s1_eid, set()))
 
         # Cap at max candidates (keep all if under limit)
         if len(merged) > config.MAX_CANDIDATES_PER_ENTITY * 2:
