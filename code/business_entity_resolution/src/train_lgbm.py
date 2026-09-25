@@ -53,10 +53,18 @@ def prepare_training_data(
     log.info(f"  Negatives: {n_neg:,} ({100*n_neg/len(labels):.1f}%)")
 
     # Split by S1 entity to avoid leakage
-    all_s1_ids = df_features["s1_id"].unique()
+    all_s1_ids = list(df_features["s1_id"].unique())
+    
+    # Handle tiny datasets during testing/mocking
+    test_size = config.VAL_FRACTION
+    if len(all_s1_ids) < 5:
+        test_size = max(1, int(len(all_s1_ids) * config.VAL_FRACTION))
+        if test_size >= len(all_s1_ids):
+            test_size = 1
+            
     train_s1, val_s1 = train_test_split(
         all_s1_ids,
-        test_size=config.VAL_FRACTION,
+        test_size=test_size,
         random_state=config.RANDOM_SEED,
     )
     train_s1_set = set(train_s1)
