@@ -279,17 +279,16 @@ def compute_embeddings(texts: np.ndarray, model_name: str = None,
     if batch_size is None:
         batch_size = config.EMBEDDING_BATCH_SIZE
 
-    log.info(f"  Computing embeddings with {model_name} for {len(texts):,} texts...")
-    model = SentenceTransformer(model_name)
-
-    # Use GPU if available
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"  Device: {device}")
 
+    log.info(f"  Computing embeddings with {model_name} for {len(texts):,} texts...")
+    model = SentenceTransformer(model_name, device=device)
+
     embeddings = model.encode(
         texts.tolist(),
-        batch_size=batch_size,
+        batch_size=512,
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=True,  # L2 normalize for cosine → inner product
