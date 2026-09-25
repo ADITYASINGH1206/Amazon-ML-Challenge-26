@@ -344,6 +344,7 @@ def dense_blocking_by_country(
     df_queries: pd.DataFrame,
     df_targets: pd.DataFrame,
     top_k: int = None,
+    split: str = "train"
 ) -> Dict[str, Set[str]]:
     """
     Dense retrieval per country partition using native PyTorch matrix multiplication.
@@ -455,12 +456,19 @@ def run_blocking(split: str = "train",
 
     # ── Strategy 1: Inverted Index ──────────────────────────
     log.info("═══ Strategy 1: Inverted Index Blocking ═══")
-    inv_index = build_inverted_index(df_targets, split=split)
-    cands_inv = query_inverted_index(
-        df_s1, inv_index, target_eids,
-        max_candidates=config.MAX_CANDIDATES_PER_ENTITY
-    )
-    del inv_index
+    inv_cands_path = f"output/inv_candidates_{split}.joblib"
+    if os.path.exists(inv_cands_path):
+        log.info("  Loading inverted index candidates from cache...")
+        cands_inv = joblib.load(inv_cands_path)
+    else:
+        inv_index = build_inverted_index(df_targets, split=split)
+        cands_inv = query_inverted_index(
+            df_s1, inv_index, target_eids,
+            max_candidates=config.MAX_CANDIDATES_PER_ENTITY
+        )
+        del inv_index
+        joblib.dump(cands_inv, inv_cands_path)
+        
     gc.collect()
     log.info(f"  Inverted index candidates: "
              f"{sum(len(v) for v in cands_inv.values()):,} pairs")
@@ -468,7 +476,14 @@ def run_blocking(split: str = "train",
 
     # ── Strategy 2: PyTorch Dense Blocking ────────────────────
     log.info("═══ Strategy 2: PyTorch Dense Blocking ═══")
-    cands_dense = dense_blocking_by_country(df_s1, df_targets, top_k=config.FAISS_TOP_K)
+    dense_cands_path = f"output/dense_candidates_{split}.joblib"
+    if os.path.exists(dense_cands_path):
+        log.info("  Loading dense candidates from cache...")
+        cands_dense = joblib.load(dense_cands_path)
+    else:
+        cands_dense = dense_blocking_by_country(df_s1, df_targets, top_k=config.FAISS_TOP_K, split=split)
+        joblib.dump(cands_dense, dense_cands_path)
+        
     log.info(f"  Dense candidates: "
              f"{sum(len(v) for v in cands_dense.values()):,} pairs")
     log_memory()
