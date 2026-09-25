@@ -220,6 +220,7 @@ def tfidf_blocking_by_country(
 
         # Use sparse_dot_topn for massive speedup and zero OOM risk
         from sparse_dot_topn import sp_matmul_topn
+        import multiprocessing
         
         tfidf_queries = vectorizer.transform(q_texts)
         
@@ -229,7 +230,9 @@ def tfidf_blocking_by_country(
         B_T = tfidf_targets.transpose().tocsr()
         
         # This executes in C++, keeps only top_k per row, and never instantiates the dense matrix!
-        sim_sparse = sp_matmul_topn(A, B_T, top_n=top_k)
+        # Enable multi-threading to use all CPU cores
+        n_jobs = multiprocessing.cpu_count()
+        sim_sparse = sp_matmul_topn(A, B_T, top_n=top_k, n_threads=n_jobs)
         
         q_eids = q_df["entity_id"].values
         
