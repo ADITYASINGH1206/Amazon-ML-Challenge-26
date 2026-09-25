@@ -288,7 +288,7 @@ def compute_embeddings(texts: np.ndarray, model_name: str = None,
 
     embeddings = model.encode(
         texts.tolist(),
-        batch_size=512,
+        batch_size=4096,
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=True,  # L2 normalize for cosine → inner product
