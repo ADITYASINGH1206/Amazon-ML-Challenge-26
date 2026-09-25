@@ -97,8 +97,10 @@ def _get_blocking_keys(name_tokens: list, addr_tokens: list,
 
 import os
 import concurrent.futures
+import joblib
+import uuid
 
-def _build_index_chunk(df_chunk: pd.DataFrame, start_idx: int) -> Dict[str, List[int]]:
+def _build_index_chunk(df_chunk: pd.DataFrame, start_idx: int, temp_dir: str) -> str:
     index = defaultdict(list)
     for i in range(len(df_chunk)):
         row = df_chunk.iloc[i]
@@ -110,7 +112,10 @@ def _build_index_chunk(df_chunk: pd.DataFrame, start_idx: int) -> Dict[str, List
         keys = _get_blocking_keys(name_tokens, addr_tokens, postal, country)
         for key in keys:
             index[key].append(start_idx + i)
-    return dict(index)
+            
+    file_path = os.path.join(temp_dir, f"chunk_{uuid.uuid4().hex}.joblib")
+    joblib.dump(dict(index), file_path)
+    return file_path
 
 @timed
 def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
@@ -121,6 +126,9 @@ def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
     n_workers = os.cpu_count() or 4
     chunk_size = max(1, len(df_targets) // n_workers)
     
+    temp_dir = "output/temp_indexes"
+    os.makedirs(temp_dir, exist_ok=True)
+    
     chunks = []
     for i in range(0, len(df_targets), chunk_size):
         chunks.append((df_targets.iloc[i:i+chunk_size], i))
@@ -129,12 +137,14 @@ def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
     
     log.info(f"  Building inverted index using {n_workers} processes in {len(chunks)} chunks...")
     with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-        futures = [executor.submit(_build_index_chunk, chunk, start) for chunk, start in chunks]
+        futures = [executor.submit(_build_index_chunk, chunk, start, temp_dir) for chunk, start in chunks]
         
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Merging index chunks"):
-            partial_idx = future.result()
+            file_path = future.result()
+            partial_idx = joblib.load(file_path)
             for key, val in partial_idx.items():
                 global_index[key].extend(val)
+            os.remove(file_path)
 
     # Prune overly common keys
     pruned = 0
