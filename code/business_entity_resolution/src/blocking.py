@@ -323,20 +323,31 @@ def compute_embeddings(texts: np.ndarray, model_name: str = None,
     log.info(f"  Computing embeddings with {model_name} for {len(texts):,} texts...")
     model = SentenceTransformer(model_name, device=device)
 
-    embeddings = model.encode(
-        texts.tolist(),
-        batch_size=4096,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,  # L2 normalize for cosine → inner product
-        device=device,
-    )
+    texts_list = texts.tolist()
+    chunk_size = 500_000
+    all_chunks = []
+
+    for i in range(0, len(texts_list), chunk_size):
+        chunk = texts_list[i : i + chunk_size]
+        log.info(f"    Encoding chunk {i // chunk_size + 1}/{(len(texts_list) - 1) // chunk_size + 1}...")
+        chunk_emb = model.encode(
+            chunk,
+            batch_size=4096,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,  # L2 normalize for cosine → inner product
+            device=device,
+        )
+        chunk_emb = chunk_emb.astype(np.float16)
+        all_chunks.append(chunk_emb)
+
+    embeddings = np.vstack(all_chunks)
 
     if save_path is not None:
         np.save(save_path, embeddings)
         log.info(f"  Embeddings saved to {save_path.name}")
 
-    return embeddings.astype(np.float32)
+    return embeddings
 
 
 @timed
