@@ -290,7 +290,7 @@ def extract_pair_features(
 # BATCH FEATURE EXTRACTION
 # ─────────────────────────────────────────────────────────────
 
-def _process_feature_chunk(chunk_path: str, idf_name: Dict[str, float], idf_addr: Dict[str, float], idf_combined: Dict[str, float]) -> pd.DataFrame:
+def _process_feature_chunk(chunk_path: str, idf_name: Dict[str, float], idf_addr: Dict[str, float], idf_combined: Dict[str, float]) -> str:
     """Top-level worker function for extracting features from a parquet chunk on disk."""
     df_chunk = pd.read_parquet(chunk_path)
     
@@ -310,19 +310,27 @@ def _process_feature_chunk(chunk_path: str, idf_name: Dict[str, float], idf_addr
         )
         
     df_res = pd.DataFrame(feats_matrix, columns=[f"f_{i}" for i in range(n_features)])
-    df_res.insert(0, "s1_id", df_chunk["s1_id"].values)
-    df_res.insert(1, "s2s3_id", df_chunk["s2s3_id"].values)
+    
+    # Use PyArrow strings to massively reduce RAM footprint of string columns
+    df_res.insert(0, "s1_id", df_chunk["s1_id"].astype("string[pyarrow]").values)
+    df_res.insert(1, "s2s3_id", df_chunk["s2s3_id"].astype("string[pyarrow]").values)
     
     del df_chunk, feats_matrix
     gc.collect()
     
-    # Clean up the temp file
+    # Save the result directly to disk to prevent joblib from hoarding RAM
+    out_path = chunk_path.replace(".parquet", "_out.parquet")
+    df_res.to_parquet(out_path)
+    del df_res
+    gc.collect()
+    
+    # Clean up the input temp file
     try:
         Path(chunk_path).unlink(missing_ok=True)
     except:
         pass
         
-    return df_res
+    return out_path
 
 @timed
 def extract_features_for_pairs(
@@ -475,12 +483,19 @@ def extract_features_for_pairs(
     import joblib
     log.info("Launching Loky workers...")
     
-    results = joblib.Parallel(n_jobs=-1, batch_size=1, backend="loky")(
+    out_paths = joblib.Parallel(n_jobs=-1, batch_size=1, backend="loky")(
         joblib.delayed(_process_feature_chunk)(path, idf_name, idf_addr, idf_combined) 
         for path in tqdm(chunk_paths, desc="Feature extraction chunks", mininterval=5)
     )
 
-    df_features = pd.concat([r for r in results if not r.empty], ignore_index=True) if results else pd.DataFrame()
+    log.info("Concatenating finished chunks...")
+    chunks_list = []
+    for p in out_paths:
+        if p and Path(p).exists():
+            chunks_list.append(pd.read_parquet(p))
+            Path(p).unlink(missing_ok=True)
+            
+    df_features = pd.concat(chunks_list, ignore_index=True) if chunks_list else pd.DataFrame()
     log.info(f"  Feature matrix shape: {df_features.shape}")
     log_memory()
 
