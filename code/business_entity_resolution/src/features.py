@@ -343,83 +343,81 @@ def extract_features_for_pairs(
     total_pairs = sum(len(v) for v in candidates.items())
     log.info(f"Extracting features for {total_pairs:,} pairs...")
 
-    # Extract features in batches
-    results = []
-    batch_s1_ids = []
-    batch_s2s3_ids = []
-    batch_features = []
+    import joblib
 
-    pair_count = 0
-    for s1_eid, cand_set in tqdm(candidates.items(), desc="Feature extraction",
-                                  mininterval=10):
-        if s1_eid not in s1_lookup:
-            continue
-
-        row_s1 = s1_lookup[s1_eid]
-        n1 = _safe_str(row_s1.get("name_clean", ""))
-        a1 = _safe_str(row_s1.get("addr_clean", ""))
-        na1 = _safe_str(row_s1.get("name_addr", ""))
-        sn1 = _safe_str(row_s1.get("street_num", ""))
-        pc1 = _safe_str(row_s1.get("postal", ""))
-        c1 = _safe_str(row_s1.get("country_clean", ""))
-
-        for cand_eid in cand_set:
-            if cand_eid not in target_lookup:
+    def process_chunk(chunk):
+        batch_s1_ids = []
+        batch_s2s3_ids = []
+        batch_features = []
+        for s1_eid, cand_set in chunk:
+            if s1_eid not in s1_lookup:
                 continue
 
-            row_t = target_lookup[cand_eid]
-            n2 = _safe_str(row_t.get("name_clean", ""))
-            a2 = _safe_str(row_t.get("addr_clean", ""))
-            na2 = _safe_str(row_t.get("name_addr", ""))
-            sn2 = _safe_str(row_t.get("street_num", ""))
-            pc2 = _safe_str(row_t.get("postal", ""))
-            c2 = _safe_str(row_t.get("country_clean", ""))
+            row_s1 = s1_lookup[s1_eid]
+            n1 = _safe_str(row_s1.get("name_clean", ""))
+            a1 = _safe_str(row_s1.get("addr_clean", ""))
+            na1 = _safe_str(row_s1.get("name_addr", ""))
+            sn1 = _safe_str(row_s1.get("street_num", ""))
+            pc1 = _safe_str(row_s1.get("postal", ""))
+            c1 = _safe_str(row_s1.get("country_clean", ""))
 
-            # Embedding cosine
-            emb_cos = 0.0
-            if (embeddings_s1 is not None and embeddings_targets is not None
-                    and s1_eid_to_idx is not None and target_eid_to_idx is not None):
-                s1_idx = s1_eid_to_idx.get(s1_eid)
-                t_idx = target_eid_to_idx.get(cand_eid)
-                if s1_idx is not None and t_idx is not None:
-                    emb_cos = float(np.dot(
-                        embeddings_s1[s1_idx],
-                        embeddings_targets[t_idx]
-                    ))
+            for cand_eid in cand_set:
+                if cand_eid not in target_lookup:
+                    continue
 
-            feats = extract_pair_features(
-                n1, a1, na1, sn1, pc1, c1,
-                n2, a2, na2, sn2, pc2, c2,
-                cand_eid,
-                idf_name, idf_addr, idf_combined,
-                emb_cos,
-            )
+                row_t = target_lookup[cand_eid]
+                n2 = _safe_str(row_t.get("name_clean", ""))
+                a2 = _safe_str(row_t.get("addr_clean", ""))
+                na2 = _safe_str(row_t.get("name_addr", ""))
+                sn2 = _safe_str(row_t.get("street_num", ""))
+                pc2 = _safe_str(row_t.get("postal", ""))
+                c2 = _safe_str(row_t.get("country_clean", ""))
 
-            batch_s1_ids.append(s1_eid)
-            batch_s2s3_ids.append(cand_eid)
-            batch_features.append(feats)
-            pair_count += 1
+                # Embedding cosine
+                emb_cos = 0.0
+                if (embeddings_s1 is not None and embeddings_targets is not None
+                        and s1_eid_to_idx is not None and target_eid_to_idx is not None):
+                    s1_idx = s1_eid_to_idx.get(s1_eid)
+                    t_idx = target_eid_to_idx.get(cand_eid)
+                    if s1_idx is not None and t_idx is not None:
+                        emb_cos = float(np.dot(
+                            embeddings_s1[s1_idx],
+                            embeddings_targets[t_idx]
+                        ))
 
-            # Flush batch periodically
-            if len(batch_features) >= config.FEATURE_BATCH_SIZE:
-                results.append(pd.DataFrame({
-                    "s1_id": batch_s1_ids,
-                    "s2s3_id": batch_s2s3_ids,
-                    **{f"f_{i}": [f[i] for f in batch_features]
-                       for i in range(len(FEATURE_NAMES))},
-                }))
-                batch_s1_ids, batch_s2s3_ids, batch_features = [], [], []
+                feats = extract_pair_features(
+                    n1, a1, na1, sn1, pc1, c1,
+                    n2, a2, na2, sn2, pc2, c2,
+                    cand_eid,
+                    idf_name, idf_addr, idf_combined,
+                    emb_cos,
+                )
 
-    # Flush remaining
-    if batch_features:
-        results.append(pd.DataFrame({
+                batch_s1_ids.append(s1_eid)
+                batch_s2s3_ids.append(cand_eid)
+                batch_features.append(feats)
+
+        if not batch_features:
+            return pd.DataFrame()
+
+        return pd.DataFrame({
             "s1_id": batch_s1_ids,
             "s2s3_id": batch_s2s3_ids,
             **{f"f_{i}": [f[i] for f in batch_features]
                for i in range(len(FEATURE_NAMES))},
-        }))
+        })
 
-    df_features = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
+    candidate_items = list(candidates.items())
+    chunk_size = 5000
+    chunks = [candidate_items[i:i + chunk_size] for i in range(0, len(candidate_items), chunk_size)]
+
+    log.info(f"Processing {len(chunks)} chunks using joblib threading...")
+    results = joblib.Parallel(n_jobs=-1, backend="threading")(
+        joblib.delayed(process_chunk)(chunk) 
+        for chunk in tqdm(chunks, desc="Feature extraction chunks", mininterval=5)
+    )
+
+    df_features = pd.concat([r for r in results if not r.empty], ignore_index=True) if results else pd.DataFrame()
     log.info(f"  Feature matrix shape: {df_features.shape}")
     log_memory()
 
