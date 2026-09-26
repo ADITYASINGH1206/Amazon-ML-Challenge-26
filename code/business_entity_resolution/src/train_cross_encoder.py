@@ -218,8 +218,10 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
         optimizer, warmup_steps, total_steps
     )
 
-    # Mixed precision
-    scaler = torch.amp.GradScaler("cuda") if (config.CE_FP16 and device.type == "cuda") else None
+    # Mixed precision with BF16 (optimal for RTX 5090 / Ampere / Ada / Blackwell)
+    use_bf16 = (config.CE_FP16 and device.type == "cuda" and torch.cuda.is_bf16_supported())
+    use_fp16 = (config.CE_FP16 and device.type == "cuda" and not use_bf16)
+    scaler = torch.amp.GradScaler("cuda") if use_fp16 else None
 
     # Training loop
     model.train()
@@ -236,8 +238,21 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             labels_batch = batch["label"].to(device, non_blocking=True)
 
-            if scaler is not None:
-                with torch.amp.autocast("cuda"):
+            if use_bf16:
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                    logits = outputs.logits.squeeze(-1)
+                    loss = loss_fn(logits, labels_batch)
+                    loss = loss / grad_accum_steps
+                loss.backward()
+
+                if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+            elif scaler is not None:
+                with torch.amp.autocast("cuda", dtype=torch.float16):
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                     logits = outputs.logits.squeeze(-1)
                     loss = loss_fn(logits, labels_batch)
@@ -341,7 +356,8 @@ class CrossEncoderScorer:
             attention_mask = encodings["attention_mask"].to(self.device)
 
             if config.CE_FP16 and self.device.type == "cuda":
-                with torch.amp.autocast("cuda"):
+                ce_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                with torch.amp.autocast("cuda", dtype=ce_dtype):
                     outputs = self.model(input_ids=input_ids,
                                          attention_mask=attention_mask)
             else:

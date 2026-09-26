@@ -429,10 +429,15 @@ def run_inference(split: str = "test"):
 
     # ── Load optimal threshold ──────────────────────────
     threshold_path = config.MODELS_DIR / "optimal_threshold.pkl"
+    lgbm_threshold_path = config.MODELS_DIR / "lgbm_threshold.pkl"
     if threshold_path.exists():
         with open(threshold_path, "rb") as f:
             threshold = pickle.load(f)
-        log.info(f"Using saved threshold: τ = {threshold:.3f}")
+        log.info(f"Using saved optimal threshold: τ = {threshold:.3f}")
+    elif lgbm_threshold_path.exists():
+        with open(lgbm_threshold_path, "rb") as f:
+            threshold = pickle.load(f)
+        log.info(f"Using saved LightGBM threshold: τ = {threshold:.3f}")
     else:
         threshold = 0.75  # Conservative default
         log.warning(f"No saved threshold found. Using default: τ = {threshold:.3f}")
