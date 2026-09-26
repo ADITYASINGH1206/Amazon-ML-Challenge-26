@@ -132,11 +132,11 @@ LGBM_CASCADE_TOP_K = 5
 # ─────────────────────────────────────────────────────────────
 
 CE_BATCH_SIZE      = 64
-CE_LEARNING_RATE   = 2e-5
+CE_LEARNING_RATE   = 1e-5
 CE_EPOCHS          = 2
 CE_WARMUP_RATIO    = 0.1
 CE_MAX_TRAIN_PAIRS = 500_000   # cap training pairs for speed
-CE_FP16            = True
+CE_FP16            = False
 
 
 # ─────────────────────────────────────────────────────────────

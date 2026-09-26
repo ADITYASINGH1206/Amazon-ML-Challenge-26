@@ -279,6 +279,11 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
                     optimizer.zero_grad()
                     scheduler.step()
 
+            if not torch.isfinite(loss):
+                log.warning(f"Non-finite loss ({loss.item()}) at step {step}, skipping batch...")
+                optimizer.zero_grad()
+                continue
+
             total_loss += loss.item() * grad_accum_steps
             n_batches += 1
             pbar.set_postfix({"loss": f"{total_loss/n_batches:.4f}"})
