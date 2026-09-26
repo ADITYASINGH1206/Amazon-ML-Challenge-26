@@ -208,6 +208,7 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.CE_LEARNING_RATE,
+        eps=1e-6,
         weight_decay=0.01,
     )
 
@@ -241,50 +242,50 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
             if use_bf16:
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    logits = outputs.logits.squeeze(-1)
+                    logits = torch.clamp(outputs.logits.squeeze(-1), min=-20.0, max=20.0)
                     loss = loss_fn(logits, labels_batch)
-                    loss = loss / grad_accum_steps
-                loss.backward()
-
-                if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    scheduler.step()
             elif scaler is not None:
                 with torch.amp.autocast("cuda", dtype=torch.float16):
                     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                    logits = outputs.logits.squeeze(-1)
+                    logits = torch.clamp(outputs.logits.squeeze(-1), min=-20.0, max=20.0)
                     loss = loss_fn(logits, labels_batch)
-                    loss = loss / grad_accum_steps
-                scaler.scale(loss).backward()
-
-                if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                    scheduler.step()
             else:
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-                logits = outputs.logits.squeeze(-1)
+                logits = torch.clamp(outputs.logits.squeeze(-1), min=-20.0, max=20.0)
                 loss = loss_fn(logits, labels_batch)
-                loss = loss / grad_accum_steps
-                loss.backward()
-
-                if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
-                    scheduler.step()
 
             if not torch.isfinite(loss):
-                log.warning(f"Non-finite loss ({loss.item()}) at step {step}, skipping batch...")
+                log.warning(f"Non-finite loss at step {step}, skipping batch...")
                 optimizer.zero_grad()
                 continue
 
-            total_loss += loss.item() * grad_accum_steps
+            loss_scaled = loss / grad_accum_steps
+            if scaler is not None:
+                scaler.scale(loss_scaled).backward()
+            else:
+                loss_scaled.backward()
+
+            if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    if torch.isfinite(grad_norm):
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
+                    else:
+                        scaler.update()
+                        log.warning(f"Non-finite grad norm at step {step}, skipping update...")
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    if torch.isfinite(grad_norm):
+                        optimizer.step()
+                        scheduler.step()
+                    else:
+                        log.warning(f"Non-finite grad norm at step {step}, skipping update...")
+                optimizer.zero_grad()
+
+            total_loss += loss.item()
             n_batches += 1
             pbar.set_postfix({"loss": f"{total_loss/n_batches:.4f}"})
 
