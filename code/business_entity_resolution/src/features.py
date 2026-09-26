@@ -290,8 +290,9 @@ def extract_pair_features(
 # BATCH FEATURE EXTRACTION
 # ─────────────────────────────────────────────────────────────
 
-def _process_feature_chunk(df_chunk: pd.DataFrame, idf_name: Dict[str, float], idf_addr: Dict[str, float], idf_combined: Dict[str, float]) -> pd.DataFrame:
-    """Top-level worker function for extracting features from a chunk of candidate pairs."""
+def _process_feature_chunk(chunk_path: str, idf_name: Dict[str, float], idf_addr: Dict[str, float], idf_combined: Dict[str, float]) -> pd.DataFrame:
+    """Top-level worker function for extracting features from a parquet chunk on disk."""
+    df_chunk = pd.read_parquet(chunk_path)
     batch_features = []
     
     for row in df_chunk.itertuples(index=False):
@@ -310,6 +311,15 @@ def _process_feature_chunk(df_chunk: pd.DataFrame, idf_name: Dict[str, float], i
     df_res.insert(0, "s1_id", df_chunk["s1_id"].values)
     df_res.insert(1, "s2s3_id", df_chunk["s2s3_id"].values)
     
+    del df_chunk
+    gc.collect()
+    
+    # Clean up the temp file
+    try:
+        Path(chunk_path).unlink(missing_ok=True)
+    except:
+        pass
+        
     return df_res
 
 @timed
@@ -420,43 +430,62 @@ def extract_features_for_pairs(
     del df_s1, df_targets
     gc.collect()
 
-    def chunk_generator():
-        chunk_size = math.ceil(len(df_pairs) / 48)
-        for i in range(0, len(df_pairs), chunk_size):
-            chunk = df_pairs.iloc[i:i + chunk_size].copy()
-            
-            # Map string IDs to integer indices fast
-            idx1 = chunk["s1_id"].map(s1_eid_to_idx).fillna(-1).astype(int).values
-            idx2 = chunk["s2s3_id"].map(target_eid_to_idx).fillna(-1).astype(int).values
-            
-            # Instantly index arrays to populate strings
-            chunk["n1"] = s1_cols['n'][idx1]
-            chunk["a1"] = s1_cols['a'][idx1]
-            chunk["na1"] = s1_cols['na'][idx1]
-            chunk["sn1"] = s1_cols['sn'][idx1]
-            chunk["pc1"] = s1_cols['pc'][idx1]
-            chunk["c1"] = s1_cols['c'][idx1]
+    log.info("Dumping chunk batches to disk to prevent multiprocessing memory explosions...")
+    chunk_paths = []
+    tmp_dir = Path("tmp_feature_chunks")
+    tmp_dir.mkdir(exist_ok=True)
+    
+    chunk_size = math.ceil(len(df_pairs) / 48)
+    for i, start_idx in enumerate(tqdm(range(0, len(df_pairs), chunk_size), desc="Writing temp disk chunks")):
+        chunk = df_pairs.iloc[start_idx:start_idx + chunk_size].copy()
+        
+        # Map string IDs to integer indices fast
+        idx1 = chunk["s1_id"].map(s1_eid_to_idx).fillna(-1).astype(int).values
+        idx2 = chunk["s2s3_id"].map(target_eid_to_idx).fillna(-1).astype(int).values
+        
+        # Instantly index arrays to populate strings
+        chunk["n1"] = s1_cols['n'][idx1]
+        chunk["a1"] = s1_cols['a'][idx1]
+        chunk["na1"] = s1_cols['na'][idx1]
+        chunk["sn1"] = s1_cols['sn'][idx1]
+        chunk["pc1"] = s1_cols['pc'][idx1]
+        chunk["c1"] = s1_cols['c'][idx1]
 
-            chunk["n2"] = t_cols['n'][idx2]
-            chunk["a2"] = t_cols['a'][idx2]
-            chunk["na2"] = t_cols['na'][idx2]
-            chunk["sn2"] = t_cols['sn'][idx2]
-            chunk["pc2"] = t_cols['pc'][idx2]
-            chunk["c2"] = t_cols['c'][idx2]
-            yield chunk
+        chunk["n2"] = t_cols['n'][idx2]
+        chunk["a2"] = t_cols['a'][idx2]
+        chunk["na2"] = t_cols['na'][idx2]
+        chunk["sn2"] = t_cols['sn'][idx2]
+        chunk["pc2"] = t_cols['pc'][idx2]
+        chunk["c2"] = t_cols['c'][idx2]
+        
+        # Save to disk and clear from RAM immediately
+        path = tmp_dir / f"chunk_{i}.parquet"
+        chunk.to_parquet(path)
+        chunk_paths.append(str(path))
+        
+        del chunk, idx1, idx2
+    
+    # Extremely aggressive cleanup before Loky launch
+    del df_pairs, s1_cols, t_cols, s1_eid_to_idx, target_eid_to_idx
+    gc.collect()
 
     import joblib
     log.info("Launching Loky workers...")
     
-    # We set pre_dispatch='2*n_jobs' (default) but since our generator is now milliseconds, it will immediately saturate cores
     results = joblib.Parallel(n_jobs=-1, batch_size=1, backend="loky")(
-        joblib.delayed(_process_feature_chunk)(chunk, idf_name, idf_addr, idf_combined) 
-        for chunk in tqdm(chunk_generator(), total=48, desc="Feature extraction chunks", mininterval=5)
+        joblib.delayed(_process_feature_chunk)(path, idf_name, idf_addr, idf_combined) 
+        for path in tqdm(chunk_paths, desc="Feature extraction chunks", mininterval=5)
     )
 
     df_features = pd.concat([r for r in results if not r.empty], ignore_index=True) if results else pd.DataFrame()
     log.info(f"  Feature matrix shape: {df_features.shape}")
     log_memory()
+
+    # Clean up directory
+    try:
+        tmp_dir.rmdir()
+    except:
+        pass
 
     return df_features
 
