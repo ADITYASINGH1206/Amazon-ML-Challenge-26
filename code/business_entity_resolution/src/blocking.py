@@ -69,15 +69,16 @@ def _get_blocking_keys(name_tokens: list, addr_tokens: list,
     if street_nums and addr_sig:
         keys.append(f"sn:{country}:{street_nums[0]}:{addr_sig[0]}")
 
-    # Key type 5: phonetic key (Soundex of first name word + country)
+    # Key type 5: phonetic key (Metaphone of first name word + country)
+    # P4 fix: Swap Soundex → Metaphone for better French/Indian name support
     if HAS_JELLYFISH and name_sig:
         try:
             import jellyfish
-            sdx = jellyfish.soundex(name_sig[0])
-            keys.append(f"sx:{country}:{sdx}")
+            mph = jellyfish.metaphone(name_sig[0])
+            keys.append(f"mph:{country}:{mph}")
             if len(name_sig) > 1:
-                sdx2 = jellyfish.soundex(name_sig[1])
-                keys.append(f"sx2:{country}:{sdx}:{sdx2}")
+                mph2 = jellyfish.metaphone(name_sig[1])
+                keys.append(f"mph2:{country}:{mph}:{mph2}")
         except Exception:
             pass
 
@@ -202,7 +203,7 @@ def query_inverted_index(df_queries: pd.DataFrame,
 
 
 # ─────────────────────────────────────────────────────────────
-# STRATEGY 2: TF-IDF CHARACTER N-GRAM RETRIEVAL
+# STRATEGY 2: TF-IDF CHARACTER N-GRAM RETRIEVAL (P4: SPLIT NAME + ADDR)
 # ─────────────────────────────────────────────────────────────
 
 @timed
@@ -213,14 +214,18 @@ def tfidf_blocking_by_country(
     batch_size: int = 100,
 ) -> Dict[str, Set[str]]:
     """
-    TF-IDF character n-gram blocking, processed per-country partition.
+    P4 fix: Split TF-IDF into name-only and addr-only vectorizers.
 
-    Uses dense matrix multiplication in tiny batches to prevent OOM.
+    This prevents address dilution — long addresses no longer drown out
+    short business names in the n-gram vectors.
     """
-    from sklearn.metrics.pairwise import cosine_similarity
+    from sparse_dot_topn import sp_matmul_topn
+    import multiprocessing
 
     candidates = {}
     countries = df_queries["country_clean"].unique()
+    top_k_each = max(top_k // 2, 15)
+    n_jobs = multiprocessing.cpu_count()
 
     for country in countries:
         log.info(f"  TF-IDF blocking for country: {country}")
@@ -236,62 +241,67 @@ def tfidf_blocking_by_country(
 
         log.info(f"    Queries: {len(q_df):,}, Targets: {len(t_df):,}")
 
-        # Fit TF-IDF on targets
-        vectorizer = TfidfVectorizer(
+        q_eids = q_df["entity_id"].values
+        t_eids = t_df["entity_id"].values
+
+        # P4 fix: Vectorizer 1 — Name only
+        log.info("    Fitting TF-IDF on name_clean...")
+        vectorizer_name = TfidfVectorizer(
             analyzer=config.TFIDF_ANALYZER,
             ngram_range=config.TFIDF_NGRAM_RANGE,
             max_features=config.TFIDF_MAX_FEATURES,
             sublinear_tf=True,
             dtype=np.float32,
         )
+        t_names = t_df["name_clean"].fillna("").values
+        q_names = q_df["name_clean"].fillna("").values
+        tfidf_t_name = vectorizer_name.fit_transform(t_names)
+        tfidf_q_name = vectorizer_name.transform(q_names)
+        A_name = tfidf_q_name.tocsr()
+        B_T_name = tfidf_t_name.transpose().tocsr()
+        sim_name = sp_matmul_topn(A_name, B_T_name, top_n=top_k_each, n_threads=n_jobs)
 
-        t_texts = t_df["name_addr"].fillna("").values
-        q_texts = q_df["name_addr"].fillna("").values
-
-        log.info("    Fitting TF-IDF vectorizer...")
-        tfidf_targets = vectorizer.fit_transform(t_texts)
-        log.info(f"    Target TF-IDF shape: {tfidf_targets.shape}")
-
-        # Use sparse_dot_topn for massive speedup and zero OOM risk
-        from sparse_dot_topn import sp_matmul_topn
-        import multiprocessing
-        
-        tfidf_queries = vectorizer.transform(q_texts)
-        
-        log.info(f"    Computing sparse dot product (top_{top_k})...")
-        # Ensure CSR format for fast C++ processing
-        A = tfidf_queries.tocsr()
-        B_T = tfidf_targets.transpose().tocsr()
-        
-        # This executes in C++, keeps only top_k per row, and never instantiates the dense matrix!
-        # Enable multi-threading to use all CPU cores
-        n_jobs = multiprocessing.cpu_count()
-        sim_sparse = sp_matmul_topn(A, B_T, top_n=top_k, n_threads=n_jobs)
-        
-        q_eids = q_df["entity_id"].values
-        t_eids = t_df["entity_id"].values
-        
-        log.info("    Extracting candidates...")
-        # sim_sparse is a CSR matrix
-        for i in range(sim_sparse.shape[0]):
+        for i in range(sim_name.shape[0]):
             q_eid = q_eids[i]
             if q_eid not in candidates:
                 candidates[q_eid] = set()
-                
-            # CSR format: indices for row i are stored in indices[indptr[i]:indptr[i+1]]
-            start_idx = sim_sparse.indptr[i]
-            end_idx = sim_sparse.indptr[i+1]
-            
-            for ptr in range(start_idx, end_idx):
-                ti = sim_sparse.indices[ptr]
-                score = sim_sparse.data[ptr]
-                if score > 0:
-                    candidates[q_eid].add(t_eids[ti])
-                    
-        del tfidf_targets, tfidf_queries, sim_sparse, vectorizer
+            for ptr in range(sim_name.indptr[i], sim_name.indptr[i+1]):
+                if sim_name.data[ptr] > 0:
+                    candidates[q_eid].add(t_eids[sim_name.indices[ptr]])
+
+        del tfidf_t_name, tfidf_q_name, sim_name, vectorizer_name
+        gc.collect()
+
+        # P4 fix: Vectorizer 2 — Address only
+        log.info("    Fitting TF-IDF on addr_clean...")
+        vectorizer_addr = TfidfVectorizer(
+            analyzer=config.TFIDF_ANALYZER,
+            ngram_range=config.TFIDF_NGRAM_RANGE,
+            max_features=config.TFIDF_MAX_FEATURES,
+            sublinear_tf=True,
+            dtype=np.float32,
+        )
+        t_addrs = t_df["addr_clean"].fillna("").values
+        q_addrs = q_df["addr_clean"].fillna("").values
+        tfidf_t_addr = vectorizer_addr.fit_transform(t_addrs)
+        tfidf_q_addr = vectorizer_addr.transform(q_addrs)
+        A_addr = tfidf_q_addr.tocsr()
+        B_T_addr = tfidf_t_addr.transpose().tocsr()
+        sim_addr = sp_matmul_topn(A_addr, B_T_addr, top_n=top_k_each, n_threads=n_jobs)
+
+        for i in range(sim_addr.shape[0]):
+            q_eid = q_eids[i]
+            if q_eid not in candidates:
+                candidates[q_eid] = set()
+            for ptr in range(sim_addr.indptr[i], sim_addr.indptr[i+1]):
+                if sim_addr.data[ptr] > 0:
+                    candidates[q_eid].add(t_eids[sim_addr.indices[ptr]])
+
+        del tfidf_t_addr, tfidf_q_addr, sim_addr, vectorizer_addr
         gc.collect()
 
     return candidates
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -518,6 +528,20 @@ def run_blocking(split: str = "train",
              f"{sum(len(v) for v in cands_dense.values()):,} pairs")
     log_memory()
 
+    # ── Strategy 3: TF-IDF Split Name+Addr Blocking ─────────
+    log.info("═══ Strategy 3: TF-IDF Split Blocking (P4) ═══")
+    tfidf_cands_path = f"output/tfidf_candidates_{split}.joblib"
+    if os.path.exists(tfidf_cands_path):
+        log.info("  Loading TF-IDF candidates from cache...")
+        cands_tfidf = joblib.load(tfidf_cands_path)
+    else:
+        cands_tfidf = tfidf_blocking_by_country(df_s1, df_targets, top_k=config.FAISS_TOP_K)
+        joblib.dump(cands_tfidf, tfidf_cands_path)
+        
+    log.info(f"  TF-IDF candidates: "
+             f"{sum(len(v) for v in cands_tfidf.values()):,} pairs")
+    log_memory()
+
     # ── Union all strategies ────────────────────────────────
     log.info("═══ Merging all blocking strategies ═══")
     all_s1_eids = df_s1["entity_id"].values
@@ -527,24 +551,20 @@ def run_blocking(split: str = "train",
     for s1_eid in tqdm(all_s1_eids, desc="Merging candidates", mininterval=10):
         inv_set = cands_inv.get(s1_eid, set())
         dense_set = cands_dense.get(s1_eid, set())
-        merged = inv_set | dense_set
+        tfidf_set = cands_tfidf.get(s1_eid, set())
+        merged = inv_set | dense_set | tfidf_set
 
-        # Enforce the cap to prevent candidate explosion (70M → ~5M pairs)
+        # Enforce the cap to prevent candidate explosion
         if len(merged) > MAX_C:
-            # Priority 1: candidates found by BOTH strategies (strongest signal)
-            both = inv_set & dense_set
-            if len(both) >= MAX_C:
-                # Even intersection is too large — just take MAX_C from it
-                merged = set(list(both)[:MAX_C])
-            else:
-                # Keep all intersection candidates, fill rest from dense (higher quality)
-                remaining = MAX_C - len(both)
-                dense_only = dense_set - both
-                inv_only = inv_set - both
-                extras = list(dense_only)[:remaining]
-                if len(extras) < remaining:
-                    extras += list(inv_only)[: remaining - len(extras)]
-                merged = both | set(extras)
+            # Priority: candidates found by multiple strategies
+            from collections import Counter
+            cand_votes = Counter()
+            for s in [inv_set, dense_set, tfidf_set]:
+                for c in s:
+                    cand_votes[c] += 1
+            # Sort by votes descending, take top MAX_C
+            top_cands = [c for c, _ in cand_votes.most_common(MAX_C)]
+            merged = set(top_cands)
 
         final_candidates[s1_eid] = merged
 

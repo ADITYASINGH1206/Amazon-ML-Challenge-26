@@ -110,14 +110,16 @@ def prepare_training_data(
 @timed
 def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray) -> lgb.LGBMClassifier:
 
-    # Dynamic positive weight
+    # P1 fix: Use scale_pos_weight=1.0 from config (NOT dynamic)
+    # Dynamic weighting compressed all scores to ~0.99, destroying margin_delta's ability
+    # to differentiate true matches from false positives
     n_pos = y_train.sum()
     n_neg = len(y_train) - n_pos
-    scale_pos = n_neg / max(n_pos, 1)
-    log.info(f"  scale_pos_weight: {scale_pos:.2f}")
+    log.info(f"  Class balance: {n_pos:,} pos, {n_neg:,} neg (ratio 1:{n_neg/max(n_pos,1):.0f})")
+    log.info(f"  scale_pos_weight: {config.LGBM_PARAMS.get('scale_pos_weight', 1.0)} (hardcoded, not dynamic)")
 
     params = config.LGBM_PARAMS.copy()
-    params["scale_pos_weight"] = scale_pos
+    # scale_pos_weight already set to 1.0 in config — do NOT override
 
     # Extract early_stopping_rounds from params (sklearn API changed)
     early_stopping = params.pop("early_stopping_rounds", 100)

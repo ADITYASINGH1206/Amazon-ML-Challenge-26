@@ -338,6 +338,13 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         lambda r: extract_postal_code(r["addr_clean"], r["country_clean"]), axis=1
     )
 
+    # P2 fix: Extract city/state from address for geographic mismatch features
+    log.info("  Extracting city/state...")
+    df[['city', 'state']] = df.apply(
+        lambda r: pd.Series(extract_city_state(r['addr_clean'], r['country_clean'])),
+        axis=1
+    )
+
     # Name tokens for blocking (significant words only)
     df["name_tokens"] = df["name_clean"].apply(
         lambda x: [t for t in x.split() if len(t) > 1]

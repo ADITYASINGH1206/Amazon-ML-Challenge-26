@@ -101,24 +101,35 @@ def cross_encoder_rerank(
     Output: same DataFrame with added 'ce_prob' column
     """
     log.info("Building text lookup for cross-encoder re-ranking...")
-    s1_text = dict(zip(df_s1["entity_id"], df_s1["name_addr"].fillna("")))
-    target_text = dict(zip(df_targets["entity_id"], df_targets["name_addr"].fillna("")))
+    # P5 fix: Use separate name/addr/city for semantic tagging (matching training format)
+    s1_name = dict(zip(df_s1["entity_id"], df_s1["name_clean"].fillna("")))
+    s1_addr = dict(zip(df_s1["entity_id"], df_s1["addr_clean"].fillna("")))
+    s1_city = dict(zip(df_s1["entity_id"], df_s1["city"].fillna("")))
+    target_name = dict(zip(df_targets["entity_id"], df_targets["name_clean"].fillna("")))
+    target_addr = dict(zip(df_targets["entity_id"], df_targets["addr_clean"].fillna("")))
+    target_city = dict(zip(df_targets["entity_id"], df_targets["city"].fillna("")))
 
     s1_ids = df_filtered["s1_id"].values
     t_ids = df_filtered["s2s3_id"].values
     lgbm_probs = df_filtered["lgbm_prob"].values
 
     # Pre-filter: only send candidates with lgbm_prob >= 0.05 to Cross-Encoder
-    # (Candidates below 0.05 cannot cross threshold >= 0.55 anyway)
     ce_candidate_mask = lgbm_probs >= 0.05
 
     text_pairs = []
     pair_indices = []
     for idx, (s1, t, eligible) in enumerate(zip(s1_ids, t_ids, ce_candidate_mask)):
         if eligible:
-            ta = s1_text.get(s1, "")
-            tb = target_text.get(t, "")
-            if ta and tb:
+            n1 = s1_name.get(s1, "")
+            a1 = s1_addr.get(s1, "")
+            c1 = s1_city.get(s1, "")
+            n2 = target_name.get(t, "")
+            a2 = target_addr.get(t, "")
+            c2 = target_city.get(t, "")
+            if n1 or a1:
+                # P5 fix: semantic boundary tagging
+                ta = f"[NAME] {n1} [ADDR] {a1} [CITY] {c1}"
+                tb = f"[NAME] {n2} [ADDR] {a2} [CITY] {c2}"
                 text_pairs.append((ta, tb))
                 pair_indices.append(idx)
 
@@ -133,7 +144,7 @@ def cross_encoder_rerank(
     df_filtered = df_filtered.copy()
     df_filtered["ce_prob"] = ce_probs_all
 
-    del s1_text, target_text, ce_probs_all
+    del s1_name, s1_addr, s1_city, target_name, target_addr, target_city, ce_probs_all
     gc.collect()
 
     return df_filtered

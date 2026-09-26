@@ -117,7 +117,7 @@ LGBM_PARAMS = {
     "colsample_bytree": 0.8,
     "reg_alpha": 0.1,
     "reg_lambda": 1.0,
-    "scale_pos_weight": 1.0,   # will be overridden dynamically
+    "scale_pos_weight": 1.0,   # P1 fix: hardcoded to 1.0 to avoid score compression
     "n_jobs": -1,
     "verbose": -1,
     "early_stopping_rounds": 150,
@@ -149,8 +149,8 @@ ENSEMBLE_WEIGHT_CE   = 0.65
 
 # Threshold search range for τ
 THRESHOLD_SEARCH_MIN  = 0.60
-THRESHOLD_SEARCH_MAX  = 0.98
-THRESHOLD_SEARCH_STEP = 0.005
+THRESHOLD_SEARCH_MAX  = 0.999   # P3 fix: allow grid search to reach optimal ~0.990
+THRESHOLD_SEARCH_STEP = 0.002   # P3 fix: finer step for precision near top
 
 # Margin-based thresholding: minimum gap between best match score
 # and next-best *conflicting* candidate score to accept a match
