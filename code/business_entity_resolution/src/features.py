@@ -372,8 +372,22 @@ def extract_features_for_pairs(
         s1_valid = s1_indices[valid_mask].values
         t_valid = t_indices[valid_mask].values
         
-        # Vectorized cosine computation
-        emb_cos[valid_mask] = (embeddings_s1[s1_valid] * embeddings_targets[t_valid]).sum(axis=1)
+        # Chunked vectorized cosine computation to prevent 50+ GiB memory spike
+        valid_idx = np.where(valid_mask)[0]
+        batch_size = 1000000
+        
+        # We need to iterate over the valid arrays, not the indices of df_pairs
+        for i in range(0, len(s1_valid), batch_size):
+            s1_batch = s1_valid[i:i+batch_size]
+            t_batch = t_valid[i:i+batch_size]
+            idx_batch = valid_idx[i:i+batch_size]
+            
+            # Compute directly into emb_cos using float32 precision
+            emb_cos[idx_batch] = (
+                embeddings_s1[s1_batch].astype(np.float32) * 
+                embeddings_targets[t_batch].astype(np.float32)
+            ).sum(axis=1)
+            
         df_pairs["emb_cos"] = emb_cos
     else:
         df_pairs["emb_cos"] = 0.0
