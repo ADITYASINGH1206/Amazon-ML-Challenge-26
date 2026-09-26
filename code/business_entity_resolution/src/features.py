@@ -417,19 +417,31 @@ def extract_features_for_pairs(
     del df_s1, df_targets
     gc.collect()
 
-    log.info("Dumping chunk batches to disk in lightweight 50k streams...")
+    # ── Tuning knobs ─────────────────────────────────────────
+    # CHUNK_SIZE=150k → ~30 chunks for 4.4M pairs (vs 96 at 50k).
+    # Fewer chunks = fewer Loky dispatch round-trips + fewer disk writes.
+    # Each 150k chunk ≈ 45MB RAM in the worker; 8 workers × 45MB = 360MB peak.
+    CHUNK_SIZE = 150_000
+    LOKY_MAX_WORKERS = min(os.cpu_count() or 4, 8)  # 8 workers safe on 16GB
+
+    # ── Phase 1: Bulk-collect all candidate pairs ───────────
+    log.info("Collecting candidate pairs into flat arrays...")
+    all_s1 = []
+    all_s2 = []
+    for s1_eid, cand_set in candidates.items():
+        for cand_eid in cand_set:
+            all_s1.append(s1_eid)
+            all_s2.append(cand_eid)
+    log.info(f"  Collected {len(all_s1):,} pairs.")
+
+    # ── Phase 2: Slice into chunks and flush to disk ────────
+    n_chunks = math.ceil(len(all_s1) / CHUNK_SIZE)
+    log.info(f"Dumping {n_chunks} chunks of {CHUNK_SIZE:,} pairs to disk...")
     chunk_paths = []
 
-    CHUNK_SIZE = 50_000
-    chunk_idx = 0
-    curr_s1_batch = []
-    curr_s2_batch = []
-
-    def _flush_batch(b_s1, b_s2, c_idx):
-        if not b_s1:
-            return None
-        arr_s1 = np.array(b_s1, dtype=object)
-        arr_s2 = np.array(b_s2, dtype=object)
+    def _flush_batch(start, end, c_idx):
+        arr_s1 = np.array(all_s1[start:end], dtype=object)
+        arr_s2 = np.array(all_s2[start:end], dtype=object)
 
         idx1 = np.array([s1_eid_to_idx.get(x, -1) for x in arr_s1], dtype=np.int32)
         idx2 = np.array([target_eid_to_idx.get(x, -1) for x in arr_s2], dtype=np.int32)
@@ -470,42 +482,22 @@ def extract_features_for_pairs(
         del chunk_df, arr_s1, arr_s2, idx1, idx2, emb_cos
         return str(path)
 
-    # Stream candidates directly into 50k disk chunks (ZERO memory accumulation!)
-    pbar = tqdm(total=total_pairs, desc="Writing temp disk chunks", mininterval=5)
-    for s1_eid, cand_set in candidates.items():
-        for cand_eid in cand_set:
-            curr_s1_batch.append(s1_eid)
-            curr_s2_batch.append(cand_eid)
-            if len(curr_s1_batch) >= CHUNK_SIZE:
-                p = _flush_batch(curr_s1_batch, curr_s2_batch, chunk_idx)
-                if p:
-                    chunk_paths.append(p)
-                pbar.update(len(curr_s1_batch))
-                curr_s1_batch = []
-                curr_s2_batch = []
-                chunk_idx += 1
+    for ci in tqdm(range(n_chunks), desc="Writing temp disk chunks", mininterval=5):
+        start = ci * CHUNK_SIZE
+        end = min(start + CHUNK_SIZE, len(all_s1))
+        p = _flush_batch(start, end, ci)
+        chunk_paths.append(p)
 
-    if curr_s1_batch:
-        p = _flush_batch(curr_s1_batch, curr_s2_batch, chunk_idx)
-        if p:
-            chunk_paths.append(p)
-        pbar.update(len(curr_s1_batch))
-        curr_s1_batch = []
-        curr_s2_batch = []
-        chunk_idx += 1
-    pbar.close()
-
-    # Extremely aggressive cleanup before Loky launch — frees almost all RAM!
+    # ── Phase 3: Aggressive cleanup before Loky launch ──────
+    del all_s1, all_s2
     del candidates, s1_cols, t_cols, s1_eid_to_idx, target_eid_to_idx
     del embeddings_s1, embeddings_targets
     gc.collect()
 
     import joblib
-    # Restrict to at most 10 workers to keep aggregate worker RAM under ~500MB
-    max_workers = min(os.cpu_count() or 4, 10)
-    log.info(f"Launching Loky workers with {max_workers} processes across {len(chunk_paths)} chunks...")
+    log.info(f"Launching Loky workers with {LOKY_MAX_WORKERS} processes across {len(chunk_paths)} chunks...")
 
-    out_paths = joblib.Parallel(n_jobs=max_workers, batch_size=1, backend="loky")(
+    out_paths = joblib.Parallel(n_jobs=LOKY_MAX_WORKERS, batch_size=1, backend="loky")(
         joblib.delayed(_process_feature_chunk)(path, idf_name, idf_addr, idf_combined)
         for path in tqdm(chunk_paths, desc="Feature extraction chunks", mininterval=5)
     )
