@@ -15,7 +15,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from collections import Counter
-from typing import Dict, Set, List, Optional
+from typing import Dict, Set, List, Optional, Iterable
 from pathlib import Path
 from tqdm import tqdm
 
@@ -100,11 +100,12 @@ def _numeric_overlap(a: str, b: str) -> float:
 # IDF COMPUTATION
 # ─────────────────────────────────────────────────────────────
 
-def compute_idf(documents: List[str]) -> Dict[str, float]:
+def compute_idf(documents: Iterable[str]) -> Dict[str, float]:
     """Compute IDF scores for tokens across a corpus."""
-    n_docs = len(documents)
+    n_docs = 0
     doc_freq = Counter()
     for doc in documents:
+        n_docs += 1
         tokens = set(doc.split()) if isinstance(doc, str) else set()
         doc_freq.update(tokens)
 
@@ -316,17 +317,19 @@ def extract_features_for_pairs(
 
     # Compute IDF
     log.info("Computing IDF scores...")
-    all_names = (
-        df_s1["name_clean"].dropna().tolist() +
-        df_targets["name_clean"].dropna().tolist()
+    from itertools import chain
+
+    all_names = chain(
+        (text for text in df_s1["name_clean"].dropna()),
+        (text for text in df_targets["name_clean"].dropna())
     )
-    all_addrs = (
-        df_s1["addr_clean"].dropna().tolist() +
-        df_targets["addr_clean"].dropna().tolist()
+    all_addrs = chain(
+        (text for text in df_s1["addr_clean"].dropna()),
+        (text for text in df_targets["addr_clean"].dropna())
     )
-    all_combined = (
-        df_s1["name_addr"].dropna().tolist() +
-        df_targets["name_addr"].dropna().tolist()
+    all_combined = chain(
+        (text for text in df_s1["name_addr"].dropna()),
+        (text for text in df_targets["name_addr"].dropna())
     )
 
     idf_name = compute_idf(all_names)
