@@ -24,38 +24,36 @@ from src.features import get_feature_columns, FEATURE_NAMES
 def prepare_training_data(
     df_features: pd.DataFrame,
     ground_truth: Dict[str, Set[str]],
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
     """
     Label candidate pairs using ground truth and split into train/val.
-
-    Labels:
-    - 1: (s1_id, s2s3_id) is a true match in ground truth
-    - 0: (s1_id, s2s3_id) is NOT a true match
-
-    Splits by S1 entity (not by pair) to avoid data leakage.
+    Returns the NumPy arrays for training, and the id-only DataFrames for validation.
     """
-    log.info(f"Labeling {len(df_features):,} candidate pairs...")
+    log.info(f"Labeling {len(df_features):,} candidate pairs using ultra-fast set lookup...")
 
-    # Label pairs
-    labels = []
-    for _, row in df_features.iterrows():
-        s1_id = row["s1_id"]
-        s2s3_id = row["s2s3_id"]
-        true_matches = ground_truth.get(s1_id, set())
-        labels.append(1 if s2s3_id in true_matches else 0)
+    # Build true match set
+    true_match_set = set()
+    for s1_id, cands in ground_truth.items():
+        for cand in cands:
+            true_match_set.add((s1_id, cand))
 
-    df_features = df_features.copy()
+    # Vectorized labeling (no loops, no copies)
+    labels = np.array([
+        1 if (s1, s2) in true_match_set else 0 
+        for s1, s2 in zip(df_features["s1_id"], df_features["s2s3_id"])
+    ], dtype=np.int8)
+    
     df_features["label"] = labels
-
-    n_pos = sum(labels)
+    
+    n_pos = labels.sum()
     n_neg = len(labels) - n_pos
     log.info(f"  Positives: {n_pos:,} ({100*n_pos/len(labels):.1f}%)")
     log.info(f"  Negatives: {n_neg:,} ({100*n_neg/len(labels):.1f}%)")
+    
+    del true_match_set
 
     # Split by S1 entity to avoid leakage
     all_s1_ids = list(df_features["s1_id"].unique())
-    
-    # Handle tiny datasets during testing/mocking
     test_size = config.VAL_FRACTION
     if len(all_s1_ids) < 5:
         test_size = max(1, int(len(all_s1_ids) * config.VAL_FRACTION))
@@ -68,28 +66,32 @@ def prepare_training_data(
         random_state=config.RANDOM_SEED,
     )
     train_s1_set = set(train_s1)
-    val_s1_set = set(val_s1)
-
-    df_train = df_features[df_features["s1_id"].isin(train_s1_set)].reset_index(drop=True)
-    df_val = df_features[df_features["s1_id"].isin(val_s1_set)].reset_index(drop=True)
-
-    log.info(f"  Train: {len(df_train):,} pairs ({df_train['label'].sum():,} pos)")
-    log.info(f"  Val:   {len(df_val):,} pairs ({df_val['label'].sum():,} pos)")
-
-    return df_train, df_val
+    
+    # Create a boolean mask instead of copying the whole dataframe
+    train_mask = df_features["s1_id"].isin(train_s1_set).values
+    val_mask = ~train_mask
+    
+    feature_cols = get_feature_columns()
+    
+    log.info("Slicing into float32 training arrays and aggressively clearing RAM...")
+    X_train = df_features.loc[train_mask, feature_cols].values.astype(np.float32)
+    y_train = labels[train_mask]
+    
+    X_val = df_features.loc[val_mask, feature_cols].values.astype(np.float32)
+    y_val = labels[val_mask]
+    
+    # We only need the IDs for validation eval
+    df_val_ids = df_features.loc[val_mask, ["s1_id", "s2s3_id", "label"]].copy()
+    df_train_ids = df_features.loc[train_mask, ["s1_id", "s2s3_id", "label"]].copy()
+    
+    log.info(f"  Train: {len(X_train):,} pairs ({y_train.sum():,} pos)")
+    log.info(f"  Val:   {len(X_val):,} pairs ({y_val.sum():,} pos)")
+    
+    return X_train, y_train, X_val, y_val, df_train_ids, df_val_ids
 
 
 @timed
-def train_lightgbm(df_train: pd.DataFrame, df_val: pd.DataFrame) -> lgb.LGBMClassifier:
-    """
-    Train LightGBM binary classifier on candidate pair features.
-    """
-    feature_cols = get_feature_columns()
-
-    X_train = df_train[feature_cols].values
-    y_train = df_train["label"].values
-    X_val = df_val[feature_cols].values
-    y_val = df_val["label"].values
+def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray) -> lgb.LGBMClassifier:
 
     # Dynamic positive weight
     n_pos = y_train.sum()
@@ -136,7 +138,8 @@ def train_lightgbm(df_train: pd.DataFrame, df_val: pd.DataFrame) -> lgb.LGBMClas
 @timed
 def evaluate_lgbm_on_val(
     model: lgb.LGBMClassifier,
-    df_val: pd.DataFrame,
+    X_val: np.ndarray,
+    df_val_ids: pd.DataFrame,
     ground_truth: Dict[str, Set[str]],
 ) -> float:
     """
@@ -144,13 +147,9 @@ def evaluate_lgbm_on_val(
 
     Grid-searches the optimal threshold τ on the validation set.
     """
-    feature_cols = get_feature_columns()
-    X_val = df_val[feature_cols].values
-
     # Get prediction probabilities
     probs = model.predict_proba(X_val)[:, 1]
-    df_val = df_val.copy()
-    df_val["lgbm_prob"] = probs
+    df_val_ids["lgbm_prob"] = probs
 
     # Grid search threshold
     best_f05 = 0.0
@@ -162,14 +161,14 @@ def evaluate_lgbm_on_val(
         config.THRESHOLD_SEARCH_STEP,
     )
 
-    val_s1_ids = df_val["s1_id"].unique()
+    val_s1_ids = df_val_ids["s1_id"].unique()
     val_gt = {s1: ground_truth.get(s1, set()) for s1 in val_s1_ids}
 
     for tau in thresholds:
         predictions = {}
         for s1_id in val_s1_ids:
-            mask = (df_val["s1_id"] == s1_id) & (df_val["lgbm_prob"] >= tau)
-            matched = set(df_val.loc[mask, "s2s3_id"].values)
+            mask = (df_val_ids["s1_id"] == s1_id) & (df_val_ids["lgbm_prob"] >= tau)
+            matched = set(df_val_ids.loc[mask, "s2s3_id"].values)
             predictions[s1_id] = matched
 
         score = macro_f05(predictions, val_gt)
@@ -183,8 +182,8 @@ def evaluate_lgbm_on_val(
     # Detailed evaluation at best threshold
     predictions = {}
     for s1_id in val_s1_ids:
-        mask = (df_val["s1_id"] == s1_id) & (df_val["lgbm_prob"] >= best_threshold)
-        matched = set(df_val.loc[mask, "s2s3_id"].values)
+        mask = (df_val_ids["s1_id"] == s1_id) & (df_val_ids["lgbm_prob"] >= best_threshold)
+        matched = set(df_val_ids.loc[mask, "s2s3_id"].values)
         predictions[s1_id] = matched
 
     eval_results = evaluate_predictions(predictions, val_gt)
@@ -222,18 +221,30 @@ def run_lgbm_training():
     # Load ground truth
     gt = load_ground_truth()
 
-    # Prepare train/val split
-    df_train, df_val = prepare_training_data(df_features, gt)
-
-    # Save val split info for cross-encoder training
-    df_val.to_parquet(config.FEATURES_DIR / "val_features.parquet", index=False)
-    df_train.to_parquet(config.FEATURES_DIR / "train_features_labeled.parquet", index=False)
+    # Prepare train/val split directly into highly efficient Numpy Arrays
+    X_train, y_train, X_val, y_val, df_train_ids, df_val_ids = prepare_training_data(df_features, gt)
+    
+    # Aggressively delete massive master dataframe to avoid OOM
+    del df_features
+    gc.collect()
 
     # Train
-    model = train_lightgbm(df_train, df_val)
+    model = train_lightgbm(X_train, y_train, X_val, y_val)
+    
+    # Pre-compute train probabilities for cross-encoder hard negative mining
+    log.info("Computing train probabilities for cross-encoder hard negative mining...")
+    df_train_ids["lgbm_prob"] = model.predict_proba(X_train)[:, 1]
+    
+    # Save the lightweight ID-only dataframes (No features needed, drastically saves disk & RAM)
+    df_val_ids.to_parquet(config.FEATURES_DIR / "val_features.parquet", index=False)
+    df_train_ids.to_parquet(config.FEATURES_DIR / "train_features_labeled.parquet", index=False)
+
+    # Clean up massive training arrays
+    del X_train, y_train
+    gc.collect()
 
     # Evaluate
-    evaluate_lgbm_on_val(model, df_val, gt)
+    evaluate_lgbm_on_val(model, X_val, df_val_ids, gt)
 
     return model
 
