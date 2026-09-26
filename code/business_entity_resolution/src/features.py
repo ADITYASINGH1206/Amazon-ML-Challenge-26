@@ -290,16 +290,16 @@ def extract_pair_features(
 # BATCH FEATURE EXTRACTION
 # ─────────────────────────────────────────────────────────────
 
-def process_feature_chunk(df_chunk: pd.DataFrame, idf_name: Dict[str, float], idf_addr: Dict[str, float], idf_combined: Dict[str, float]) -> pd.DataFrame:
+def _process_feature_chunk(df_chunk: pd.DataFrame, idf_name: Dict[str, float], idf_addr: Dict[str, float], idf_combined: Dict[str, float]) -> pd.DataFrame:
     """Top-level worker function for extracting features from a chunk of candidate pairs."""
     batch_features = []
     
     for row in df_chunk.itertuples(index=False):
         feats = extract_pair_features(
-            _safe_str(row.n1), _safe_str(row.a1), _safe_str(row.na1),
-            _safe_str(row.sn1), _safe_str(row.pc1), _safe_str(row.c1),
-            _safe_str(row.n2), _safe_str(row.a2), _safe_str(row.na2),
-            _safe_str(row.sn2), _safe_str(row.pc2), _safe_str(row.c2),
+            str(row.n1), str(row.a1), str(row.na1),
+            str(row.sn1), str(row.pc1), str(row.c1),
+            str(row.n2), str(row.a2), str(row.na2),
+            str(row.sn2), str(row.pc2), str(row.c2),
             row.s2s3_id,
             idf_name, idf_addr, idf_combined,
             row.emb_cos
@@ -392,36 +392,61 @@ def extract_features_for_pairs(
     else:
         df_pairs["emb_cos"] = 0.0
 
-    log.info("Merging text data chunk-by-chunk to prevent OOM...")
-    cols_to_merge = ["entity_id", "name_clean", "addr_clean", "name_addr", "street_num", "postal", "country_clean"]
-    
-    # Set index for fast joins
-    df_s1_sub = df_s1[cols_to_merge].set_index("entity_id")
-    df_s1_sub.columns = ["n1", "a1", "na1", "sn1", "pc1", "c1"]
-    
-    df_targets_sub = df_targets[cols_to_merge].set_index("entity_id")
-    df_targets_sub.columns = ["n2", "a2", "na2", "sn2", "pc2", "c2"]
-
-    import joblib
-    
-    # Chunk df_pairs safely using pandas iloc to prevent numpy coercion
-    chunk_size = math.ceil(len(df_pairs) / 24)
-    populated_chunks = []
-    
-    for i in range(0, len(df_pairs), chunk_size):
-        chunk = df_pairs.iloc[i:i + chunk_size]
-        # Fast left join on indices
-        c = chunk.join(df_s1_sub, on="s1_id")
-        c = c.join(df_targets_sub, on="s2s3_id")
-        populated_chunks.append(c)
-
-    del df_pairs, df_s1_sub, df_targets_sub
+    # Delete embeddings and collect garbage to free massive RAM
+    del embeddings_s1, embeddings_targets, s1_eid_to_idx, target_eid_to_idx
     gc.collect()
 
+    log.info("Building text map dictionaries...")
+    # Build text lookup dicts with native object dtypes to avoid PyArrow entirely
+    df_s1_idx = df_s1.set_index("entity_id")
+    s1_maps = {
+        'n': df_s1_idx["name_clean"].astype(str).to_dict(),
+        'a': df_s1_idx["addr_clean"].astype(str).to_dict(),
+        'na': df_s1_idx["name_addr"].astype(str).to_dict(),
+        'sn': df_s1_idx["street_num"].astype(str).to_dict(),
+        'pc': df_s1_idx["postal"].astype(str).to_dict(),
+        'c': df_s1_idx["country_clean"].astype(str).to_dict(),
+    }
+    del df_s1_idx
+    
+    df_t_idx = df_targets.set_index("entity_id")
+    t_maps = {
+        'n': df_t_idx["name_clean"].astype(str).to_dict(),
+        'a': df_t_idx["addr_clean"].astype(str).to_dict(),
+        'na': df_t_idx["name_addr"].astype(str).to_dict(),
+        'sn': df_t_idx["street_num"].astype(str).to_dict(),
+        'pc': df_t_idx["postal"].astype(str).to_dict(),
+        'c': df_t_idx["country_clean"].astype(str).to_dict(),
+    }
+    del df_t_idx, df_s1, df_targets
+    gc.collect()
+
+    def chunk_generator():
+        chunk_size = math.ceil(len(df_pairs) / 48)
+        for i in range(0, len(df_pairs), chunk_size):
+            chunk = df_pairs.iloc[i:i + chunk_size].copy()
+            # Map directly onto candidates chunk
+            chunk["n1"] = chunk["s1_id"].map(s1_maps['n']).fillna("")
+            chunk["a1"] = chunk["s1_id"].map(s1_maps['a']).fillna("")
+            chunk["na1"] = chunk["s1_id"].map(s1_maps['na']).fillna("")
+            chunk["sn1"] = chunk["s1_id"].map(s1_maps['sn']).fillna("")
+            chunk["pc1"] = chunk["s1_id"].map(s1_maps['pc']).fillna("")
+            chunk["c1"] = chunk["s1_id"].map(s1_maps['c']).fillna("")
+
+            chunk["n2"] = chunk["s2s3_id"].map(t_maps['n']).fillna("")
+            chunk["a2"] = chunk["s2s3_id"].map(t_maps['a']).fillna("")
+            chunk["na2"] = chunk["s2s3_id"].map(t_maps['na']).fillna("")
+            chunk["sn2"] = chunk["s2s3_id"].map(t_maps['sn']).fillna("")
+            chunk["pc2"] = chunk["s2s3_id"].map(t_maps['pc']).fillna("")
+            chunk["c2"] = chunk["s2s3_id"].map(t_maps['c']).fillna("")
+            yield chunk
+
+    import joblib
     log.info("Launching Loky workers...")
-    results = joblib.Parallel(n_jobs=-1, backend="loky")(
-        joblib.delayed(process_feature_chunk)(chunk, idf_name, idf_addr, idf_combined) 
-        for chunk in tqdm(populated_chunks, desc="Feature extraction chunks", mininterval=5)
+    
+    results = joblib.Parallel(n_jobs=-1, batch_size=1, backend="loky")(
+        joblib.delayed(_process_feature_chunk)(chunk, idf_name, idf_addr, idf_combined) 
+        for chunk in tqdm(chunk_generator(), total=48, desc="Feature extraction chunks", mininterval=5)
     )
 
     df_features = pd.concat([r for r in results if not r.empty], ignore_index=True) if results else pd.DataFrame()
