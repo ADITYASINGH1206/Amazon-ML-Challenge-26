@@ -57,17 +57,23 @@ def lgbm_cascade_filter(
 
     if "lgbm_prob" not in df_features.columns:
         feature_cols = get_feature_columns()
-        X = df_features[feature_cols].to_numpy(dtype=np.float32, copy=False)
-        log.info(f"  Scoring {len(X):,} pairs with LightGBM in batches...")
-        probs = np.zeros(len(X), dtype=np.float32)
-        batch_sz = 5_000_000
-        for i in range(0, len(X), batch_sz):
-            end_i = min(i + batch_sz, len(X))
-            probs[i:end_i] = model.predict_proba(X[i:end_i])[:, 1]
-        df_features = df_features[["s1_id", "s2s3_id"]].copy()
-        df_features["lgbm_prob"] = probs
-        del X, probs
-        gc.collect()
+        avail_cols = [c for c in feature_cols if c in df_features.columns]
+        if len(avail_cols) == len(feature_cols):
+            X = df_features[feature_cols].to_numpy(dtype=np.float32, copy=False)
+            log.info(f"  Scoring {len(X):,} pairs with LightGBM in batches...")
+            probs = np.zeros(len(X), dtype=np.float32)
+            batch_sz = 5_000_000
+            for i in range(0, len(X), batch_sz):
+                end_i = min(i + batch_sz, len(X))
+                probs[i:end_i] = model.predict_proba(X[i:end_i])[:, 1]
+            df_features = df_features[["s1_id", "s2s3_id"]].copy()
+            df_features["lgbm_prob"] = probs
+            del X, probs
+            gc.collect()
+        else:
+            log.warning("  df_features missing feature columns and lgbm_prob; initializing default prob 0.5")
+            df_features = df_features[["s1_id", "s2s3_id"]].copy()
+            df_features["lgbm_prob"] = 0.5
 
     # Ultra-fast vectorized top-k per S1 entity using pandas C implementation
     log.info(f"  Filtering to top-{top_k} per S1 entity...")
@@ -522,6 +528,37 @@ def run_validation_inference():
 
     # Load models
     lgbm_model = load_lgbm_model()
+
+    # If df_val is missing lgbm_prob and feature columns, reconstruct from train_features.parquet
+    if "lgbm_prob" not in df_val.columns:
+        from src.features import get_feature_columns
+        feature_cols = get_feature_columns()
+        if not any(c in df_val.columns for c in feature_cols):
+            train_path = config.FEATURES_DIR / "train_features.parquet"
+            if train_path.exists():
+                log.info("val_features.parquet missing lgbm_prob. Re-scoring validation split from train_features.parquet...")
+                df_all = pd.read_parquet(train_path)
+                all_s1 = list(df_all["s1_id"].unique())
+                test_size = max(1, int(len(all_s1) * config.VAL_FRACTION)) if len(all_s1) < 5 else config.VAL_FRACTION
+                from sklearn.model_selection import train_test_split
+                _, val_s1 = train_test_split(all_s1, test_size=test_size, random_state=config.RANDOM_SEED)
+                val_mask = df_all["s1_id"].isin(set(val_s1)).values
+                
+                df_val = df_all.loc[val_mask, ["s1_id", "s2s3_id"]].copy()
+                X_val = df_all.loc[val_mask, feature_cols].to_numpy(dtype=np.float32, copy=False)
+                del df_all
+                gc.collect()
+
+                log.info(f"Computing LightGBM probabilities for {len(X_val):,} validation pairs...")
+                probs = np.zeros(len(X_val), dtype=np.float32)
+                batch_sz = 5_000_000
+                for i in range(0, len(X_val), batch_sz):
+                    end_i = min(i + batch_sz, len(X_val))
+                    probs[i:end_i] = lgbm_model.predict_proba(X_val[i:end_i])[:, 1]
+                df_val["lgbm_prob"] = probs
+                del X_val, probs
+                df_val.to_parquet(val_path, index=False)
+                log.info(f"Updated {val_path.name} with lgbm_prob.")
 
     # LightGBM cascade
     df_filtered = lgbm_cascade_filter(df_val, lgbm_model)
