@@ -5,7 +5,10 @@ utils.py — Shared I/O helpers, timing, memory monitoring, and F0.5 computation
 import time
 import functools
 import logging
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -45,12 +48,15 @@ def timed(func):
 
 def mem_usage_gb():
     """Return current process RSS in GB."""
+    if psutil is None:
+        return 0.0
     return psutil.Process().memory_info().rss / (1024 ** 3)
 
 
 def log_memory():
     """Log current memory usage."""
-    log.info(f"  Memory: {mem_usage_gb():.2f} GB")
+    if psutil is not None:
+        log.info(f"  Memory: {mem_usage_gb():.2f} GB")
 
 
 # ─────────────────────────────────────────────────────────────
