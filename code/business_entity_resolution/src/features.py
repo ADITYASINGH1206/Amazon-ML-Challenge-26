@@ -404,17 +404,18 @@ def extract_features_for_pairs(
 
     import joblib
     
-    # Chunk df_pairs first
-    base_chunks = np.array_split(df_pairs, 24)
+    # Chunk df_pairs safely using pandas iloc to prevent numpy coercion
+    chunk_size = math.ceil(len(df_pairs) / 24)
     populated_chunks = []
     
-    for chunk in base_chunks:
+    for i in range(0, len(df_pairs), chunk_size):
+        chunk = df_pairs.iloc[i:i + chunk_size]
         # Fast left join on indices
         c = chunk.join(df_s1_sub, on="s1_id")
         c = c.join(df_targets_sub, on="s2s3_id")
         populated_chunks.append(c)
 
-    del df_pairs, df_s1_sub, df_targets_sub, base_chunks
+    del df_pairs, df_s1_sub, df_targets_sub
     gc.collect()
 
     log.info("Launching Loky workers...")
