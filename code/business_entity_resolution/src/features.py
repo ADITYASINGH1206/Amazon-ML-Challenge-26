@@ -392,58 +392,63 @@ def extract_features_for_pairs(
     else:
         df_pairs["emb_cos"] = 0.0
 
-    # Delete embeddings and collect garbage to free massive RAM
-    del embeddings_s1, embeddings_targets, s1_eid_to_idx, target_eid_to_idx
+    # Do not delete s1_eid_to_idx and target_eid_to_idx yet, we need them for fast string mapping!
+    del embeddings_s1, embeddings_targets
     gc.collect()
 
-    log.info("Building text map dictionaries...")
-    # Build text lookup dicts with native object dtypes to avoid PyArrow entirely
-    df_s1_idx = df_s1.set_index("entity_id")
-    s1_maps = {
-        'n': df_s1_idx["name_clean"].astype(str).to_dict(),
-        'a': df_s1_idx["addr_clean"].astype(str).to_dict(),
-        'na': df_s1_idx["name_addr"].astype(str).to_dict(),
-        'sn': df_s1_idx["street_num"].astype(str).to_dict(),
-        'pc': df_s1_idx["postal"].astype(str).to_dict(),
-        'c': df_s1_idx["country_clean"].astype(str).to_dict(),
+    log.info("Building ultra-fast string arrays...")
+    # Convert string columns to native Python object arrays (bypassing PyArrow entirely)
+    # This takes seconds and indexing them takes milliseconds
+    s1_cols = {
+        'n': df_s1["name_clean"].fillna("").astype(str).to_numpy(dtype=object),
+        'a': df_s1["addr_clean"].fillna("").astype(str).to_numpy(dtype=object),
+        'na': df_s1["name_addr"].fillna("").astype(str).to_numpy(dtype=object),
+        'sn': df_s1["street_num"].fillna("").astype(str).to_numpy(dtype=object),
+        'pc': df_s1["postal"].fillna("").astype(str).to_numpy(dtype=object),
+        'c': df_s1["country_clean"].fillna("").astype(str).to_numpy(dtype=object),
     }
-    del df_s1_idx
+    t_cols = {
+        'n': df_targets["name_clean"].fillna("").astype(str).to_numpy(dtype=object),
+        'a': df_targets["addr_clean"].fillna("").astype(str).to_numpy(dtype=object),
+        'na': df_targets["name_addr"].fillna("").astype(str).to_numpy(dtype=object),
+        'sn': df_targets["street_num"].fillna("").astype(str).to_numpy(dtype=object),
+        'pc': df_targets["postal"].fillna("").astype(str).to_numpy(dtype=object),
+        'c': df_targets["country_clean"].fillna("").astype(str).to_numpy(dtype=object),
+    }
     
-    df_t_idx = df_targets.set_index("entity_id")
-    t_maps = {
-        'n': df_t_idx["name_clean"].astype(str).to_dict(),
-        'a': df_t_idx["addr_clean"].astype(str).to_dict(),
-        'na': df_t_idx["name_addr"].astype(str).to_dict(),
-        'sn': df_t_idx["street_num"].astype(str).to_dict(),
-        'pc': df_t_idx["postal"].astype(str).to_dict(),
-        'c': df_t_idx["country_clean"].astype(str).to_dict(),
-    }
-    del df_t_idx, df_s1, df_targets
+    # We no longer need the original dataframes
+    del df_s1, df_targets
     gc.collect()
 
     def chunk_generator():
         chunk_size = math.ceil(len(df_pairs) / 48)
         for i in range(0, len(df_pairs), chunk_size):
             chunk = df_pairs.iloc[i:i + chunk_size].copy()
-            # Map directly onto candidates chunk
-            chunk["n1"] = chunk["s1_id"].map(s1_maps['n']).fillna("")
-            chunk["a1"] = chunk["s1_id"].map(s1_maps['a']).fillna("")
-            chunk["na1"] = chunk["s1_id"].map(s1_maps['na']).fillna("")
-            chunk["sn1"] = chunk["s1_id"].map(s1_maps['sn']).fillna("")
-            chunk["pc1"] = chunk["s1_id"].map(s1_maps['pc']).fillna("")
-            chunk["c1"] = chunk["s1_id"].map(s1_maps['c']).fillna("")
+            
+            # Map string IDs to integer indices fast
+            idx1 = chunk["s1_id"].map(s1_eid_to_idx).fillna(-1).astype(int).values
+            idx2 = chunk["s2s3_id"].map(target_eid_to_idx).fillna(-1).astype(int).values
+            
+            # Instantly index arrays to populate strings
+            chunk["n1"] = s1_cols['n'][idx1]
+            chunk["a1"] = s1_cols['a'][idx1]
+            chunk["na1"] = s1_cols['na'][idx1]
+            chunk["sn1"] = s1_cols['sn'][idx1]
+            chunk["pc1"] = s1_cols['pc'][idx1]
+            chunk["c1"] = s1_cols['c'][idx1]
 
-            chunk["n2"] = chunk["s2s3_id"].map(t_maps['n']).fillna("")
-            chunk["a2"] = chunk["s2s3_id"].map(t_maps['a']).fillna("")
-            chunk["na2"] = chunk["s2s3_id"].map(t_maps['na']).fillna("")
-            chunk["sn2"] = chunk["s2s3_id"].map(t_maps['sn']).fillna("")
-            chunk["pc2"] = chunk["s2s3_id"].map(t_maps['pc']).fillna("")
-            chunk["c2"] = chunk["s2s3_id"].map(t_maps['c']).fillna("")
+            chunk["n2"] = t_cols['n'][idx2]
+            chunk["a2"] = t_cols['a'][idx2]
+            chunk["na2"] = t_cols['na'][idx2]
+            chunk["sn2"] = t_cols['sn'][idx2]
+            chunk["pc2"] = t_cols['pc'][idx2]
+            chunk["c2"] = t_cols['c'][idx2]
             yield chunk
 
     import joblib
     log.info("Launching Loky workers...")
     
+    # We set pre_dispatch='2*n_jobs' (default) but since our generator is now milliseconds, it will immediately saturate cores
     results = joblib.Parallel(n_jobs=-1, batch_size=1, backend="loky")(
         joblib.delayed(_process_feature_chunk)(chunk, idf_name, idf_addr, idf_combined) 
         for chunk in tqdm(chunk_generator(), total=48, desc="Feature extraction chunks", mininterval=5)
@@ -454,7 +459,6 @@ def extract_features_for_pairs(
     log_memory()
 
     return df_features
-
 
 def get_feature_columns() -> List[str]:
     """Return list of feature column names in the feature DataFrame."""
