@@ -5,11 +5,16 @@ Combines four blocking strategies to achieve >95% recall:
 1. Composite-key inverted index (city + name prefix, postal code, etc.)
 2. Character n-gram TF-IDF sparse retrieval
 3. Phonetic (Soundex) key blocking
-4. Dense FAISS ANN retrieval (multilingual embeddings)
+4. Dense PyTorch ANN retrieval (multilingual embeddings)
 
 All strategies are partitioned by country to reduce search space.
 The union of all candidates becomes the final blocking set.
 """
+
+import os
+import joblib
+
+os.makedirs('output', exist_ok=True)
 
 import gc
 import pickle
@@ -26,19 +31,7 @@ from src import config
 from src.utils import log, timed, log_memory
 from src.preprocess import load_preprocessed
 
-try:
-    import faiss
-    HAS_FAISS = True
-except ImportError:
-    HAS_FAISS = False
-    log.warning("FAISS not installed. Dense blocking will be skipped.")
-
-try:
-    import jellyfish
-    HAS_JELLYFISH = True
-except ImportError:
-    HAS_JELLYFISH = False
-    log.warning("jellyfish not installed. Phonetic blocking will be skipped.")
+HAS_JELLYFISH = True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -79,6 +72,7 @@ def _get_blocking_keys(name_tokens: list, addr_tokens: list,
     # Key type 5: phonetic key (Soundex of first name word + country)
     if HAS_JELLYFISH and name_sig:
         try:
+            import jellyfish
             sdx = jellyfish.soundex(name_sig[0])
             keys.append(f"sx:{country}:{sdx}")
             if len(name_sig) > 1:
@@ -95,17 +89,15 @@ def _get_blocking_keys(name_tokens: list, addr_tokens: list,
     return keys
 
 
-@timed
-def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
-    """
-    Build an inverted index: blocking_key → list of target DataFrame indices.
-    """
-    index = defaultdict(list)
-    max_bucket = config.TOKEN_MAX_DF
+import os
+import concurrent.futures
+import joblib
+import uuid
 
-    for idx in tqdm(range(len(df_targets)), desc="Building inverted index",
-                    mininterval=10):
-        row = df_targets.iloc[idx]
+def _build_index_chunk(df_chunk: pd.DataFrame, start_idx: int, temp_dir: str) -> str:
+    index = defaultdict(list)
+    for i in range(len(df_chunk)):
+        row = df_chunk.iloc[i]
         name_tokens = row["name_tokens"] if isinstance(row["name_tokens"], list) else []
         addr_tokens = row["addr_tokens"] if isinstance(row["addr_tokens"], list) else []
         postal = str(row.get("postal", "")) if pd.notna(row.get("postal", "")) else ""
@@ -113,17 +105,57 @@ def build_inverted_index(df_targets: pd.DataFrame) -> Dict[str, List[int]]:
 
         keys = _get_blocking_keys(name_tokens, addr_tokens, postal, country)
         for key in keys:
-            index[key].append(idx)
+            index[key].append(start_idx + i)
+            
+    file_path = os.path.join(temp_dir, f"chunk_{uuid.uuid4().hex}.joblib")
+    joblib.dump(dict(index), file_path)
+    return file_path
+
+@timed
+def build_inverted_index(df_targets: pd.DataFrame, split: str = "train") -> Dict[str, List[int]]:
+    """
+    Build an inverted index: blocking_key → list of target DataFrame indices.
+    """
+    cache_path = f"output/inverted_index_{split}.joblib"
+    if os.path.exists(cache_path):
+        log.info("  Loading inverted index from cache...")
+        return joblib.load(cache_path)
+
+    max_bucket = config.TOKEN_MAX_DF
+    n_workers = os.cpu_count() or 4
+    chunk_size = max(1, len(df_targets) // n_workers)
+    
+    temp_dir = "output/temp_indexes"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    chunks = []
+    for i in range(0, len(df_targets), chunk_size):
+        chunks.append((df_targets.iloc[i:i+chunk_size], i))
+        
+    global_index = defaultdict(list)
+    
+    log.info(f"  Building inverted index using {n_workers} processes in {len(chunks)} chunks...")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        futures = [executor.submit(_build_index_chunk, chunk, start, temp_dir) for chunk, start in chunks]
+        
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc="Merging index chunks"):
+            file_path = future.result()
+            partial_idx = joblib.load(file_path)
+            for key, val in partial_idx.items():
+                global_index[key].extend(val)
+            os.remove(file_path)
 
     # Prune overly common keys
     pruned = 0
-    for key in list(index.keys()):
-        if len(index[key]) > max_bucket:
-            del index[key]
+    for key in list(global_index.keys()):
+        if len(global_index[key]) > max_bucket:
+            del global_index[key]
             pruned += 1
 
-    log.info(f"  Inverted index: {len(index):,} keys, {pruned:,} pruned (>{max_bucket})")
-    return dict(index)
+    final_index = dict(global_index)
+    joblib.dump(final_index, cache_path)
+    log.info(f"  Inverted index: {len(final_index):,} keys, {pruned:,} pruned (>{max_bucket})")
+    return final_index
 
 
 def query_inverted_index(df_queries: pd.DataFrame,
@@ -136,6 +168,7 @@ def query_inverted_index(df_queries: pd.DataFrame,
     Returns: {query_entity_id: set(target_entity_ids)}
     """
     candidates = {}
+    target_eids_arr = np.array(target_entity_ids)
 
     for idx in tqdm(range(len(df_queries)), desc="Querying inverted index",
                     mininterval=10):
@@ -160,7 +193,8 @@ def query_inverted_index(df_queries: pd.DataFrame,
         cand_eids = set()
         for target_idx, count in top:
             if count >= config.MIN_SHARED_TOKENS:
-                cand_eids.add(target_entity_ids[target_idx])
+                if target_idx < len(target_eids_arr):
+                    cand_eids.add(target_eids_arr[target_idx])
 
         candidates[q_eid] = cand_eids
 
@@ -176,12 +210,12 @@ def tfidf_blocking_by_country(
     df_queries: pd.DataFrame,
     df_targets: pd.DataFrame,
     top_k: int = 30,
-    batch_size: int = 5000,
+    batch_size: int = 100,
 ) -> Dict[str, Set[str]]:
     """
     TF-IDF character n-gram blocking, processed per-country partition.
 
-    Uses sparse matrix multiplication in batches to find top-k similar targets.
+    Uses dense matrix multiplication in tiny batches to prevent OOM.
     """
     from sklearn.metrics.pairwise import cosine_similarity
 
@@ -218,50 +252,49 @@ def tfidf_blocking_by_country(
         tfidf_targets = vectorizer.fit_transform(t_texts)
         log.info(f"    Target TF-IDF shape: {tfidf_targets.shape}")
 
-        t_eids = t_df["entity_id"].values
-
-        # Process queries in batches
-        for start in tqdm(range(0, len(q_df), batch_size),
-                          desc=f"  TF-IDF {country}", mininterval=5):
-            end = min(start + batch_size, len(q_df))
-            batch_texts = q_texts[start:end]
-            batch_eids = q_df["entity_id"].values[start:end]
-
-            tfidf_batch = vectorizer.transform(batch_texts)
-
-            # Sparse cosine similarity
-            sim = cosine_similarity(tfidf_batch, tfidf_targets, dense_output=False)
-
-            # Extract top-k per query
-            for i in range(sim.shape[0]):
-                row = sim.getrow(i)
-                if row.nnz == 0:
-                    candidates[batch_eids[i]] = candidates.get(batch_eids[i], set())
-                    continue
-
-                data = row.data
-                indices = row.indices
-
-                if len(data) <= top_k:
-                    top_indices = indices
-                else:
-                    top_pos = np.argpartition(data, -top_k)[-top_k:]
-                    top_indices = indices[top_pos]
-
-                q_eid = batch_eids[i]
-                if q_eid not in candidates:
-                    candidates[q_eid] = set()
-                for ti in top_indices:
+        # Use sparse_dot_topn for massive speedup and zero OOM risk
+        from sparse_dot_topn import sp_matmul_topn
+        import multiprocessing
+        
+        tfidf_queries = vectorizer.transform(q_texts)
+        
+        log.info(f"    Computing sparse dot product (top_{top_k})...")
+        # Ensure CSR format for fast C++ processing
+        A = tfidf_queries.tocsr()
+        B_T = tfidf_targets.transpose().tocsr()
+        
+        # This executes in C++, keeps only top_k per row, and never instantiates the dense matrix!
+        # Enable multi-threading to use all CPU cores
+        n_jobs = multiprocessing.cpu_count()
+        sim_sparse = sp_matmul_topn(A, B_T, top_n=top_k, n_threads=n_jobs)
+        
+        q_eids = q_df["entity_id"].values
+        
+        log.info("    Extracting candidates...")
+        # sim_sparse is a CSR matrix
+        for i in range(sim_sparse.shape[0]):
+            q_eid = q_eids[i]
+            if q_eid not in candidates:
+                candidates[q_eid] = set()
+                
+            # CSR format: indices for row i are stored in indices[indptr[i]:indptr[i+1]]
+            start_idx = sim_sparse.indptr[i]
+            end_idx = sim_sparse.indptr[i+1]
+            
+            for ptr in range(start_idx, end_idx):
+                ti = sim_sparse.indices[ptr]
+                score = sim_sparse.data[ptr]
+                if score > 0:
                     candidates[q_eid].add(t_eids[ti])
-
-        del tfidf_targets, vectorizer
+                    
+        del tfidf_targets, tfidf_queries, sim_sparse, vectorizer
         gc.collect()
 
     return candidates
 
 
 # ─────────────────────────────────────────────────────────────
-# STRATEGY 3: DENSE FAISS ANN RETRIEVAL
+# STRATEGY 3: DENSE PYTORCH ANN RETRIEVAL
 # ─────────────────────────────────────────────────────────────
 
 @timed
@@ -271,8 +304,11 @@ def compute_embeddings(texts: np.ndarray, model_name: str = None,
     """
     Compute sentence embeddings using a multilingual model.
 
-    Embeddings are L2-normalized for cosine similarity via inner product.
     """
+    if save_path is not None and Path(save_path).exists():
+        log.info(f"  Loading embeddings from {save_path}...")
+        return np.load(save_path)
+
     from sentence_transformers import SentenceTransformer
 
     if model_name is None:
@@ -280,55 +316,76 @@ def compute_embeddings(texts: np.ndarray, model_name: str = None,
     if batch_size is None:
         batch_size = config.EMBEDDING_BATCH_SIZE
 
-    log.info(f"  Computing embeddings with {model_name} for {len(texts):,} texts...")
-    model = SentenceTransformer(model_name)
-
-    # Use GPU if available
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"  Device: {device}")
 
-    embeddings = model.encode(
-        texts.tolist(),
-        batch_size=batch_size,
-        show_progress_bar=True,
-        convert_to_numpy=True,
-        normalize_embeddings=True,  # L2 normalize for cosine → inner product
-        device=device,
-    )
+    log.info(f"  Computing embeddings with {model_name} for {len(texts):,} texts...")
+    model = SentenceTransformer(model_name, device=device)
+
+    texts_list = texts.tolist()
+    chunk_size = 500_000
+    all_chunks = []
+
+    for i in range(0, len(texts_list), chunk_size):
+        chunk = texts_list[i : i + chunk_size]
+        log.info(f"    Encoding chunk {i // chunk_size + 1}/{(len(texts_list) - 1) // chunk_size + 1}...")
+        chunk_emb = model.encode(
+            chunk,
+            batch_size=4096,
+            show_progress_bar=True,
+            convert_to_numpy=True,
+            normalize_embeddings=True,  # L2 normalize for cosine → inner product
+            device=device,
+        )
+        chunk_emb = chunk_emb.astype(np.float16)
+        all_chunks.append(chunk_emb)
+
+    embeddings = np.vstack(all_chunks)
 
     if save_path is not None:
         np.save(save_path, embeddings)
         log.info(f"  Embeddings saved to {save_path.name}")
 
-    return embeddings.astype(np.float32)
+    return embeddings
 
 
 @timed
-def faiss_blocking_by_country(
+def dense_blocking_by_country(
     df_queries: pd.DataFrame,
     df_targets: pd.DataFrame,
     top_k: int = None,
+    split: str = "train"
 ) -> Dict[str, Set[str]]:
     """
-    Dense FAISS ANN retrieval per country partition.
-
-    Uses multilingual sentence-transformer embeddings indexed with FAISS IVF.
+    Dense retrieval per country partition using native PyTorch matrix multiplication.
     """
-    if not HAS_FAISS:
-        log.warning("FAISS not available, skipping dense blocking")
-        return {}
 
     if top_k is None:
         top_k = config.FAISS_TOP_K
 
     import torch
 
+    target_cache = f'output/target_embeddings_{split}.npy'
+    query_cache = f'output/query_embeddings_{split}.npy'
+
+    if os.path.exists(target_cache) and os.path.exists(query_cache):
+        log.info("  Loading global embeddings from cache...")
+        global_emb_targets = np.load(target_cache)
+        global_emb_queries = np.load(query_cache)
+    else:
+        log.info("  Computing global embeddings...")
+        t_texts = df_targets["name_addr"].fillna("").values
+        q_texts = df_queries["name_addr"].fillna("").values
+
+        global_emb_targets = compute_embeddings(t_texts, save_path=Path(target_cache))
+        global_emb_queries = compute_embeddings(q_texts, save_path=Path(query_cache))
+
     candidates = {}
     countries = df_queries["country_clean"].unique()
 
     for country in countries:
-        log.info(f"  FAISS blocking for country: {country}")
+        log.info(f"  Dense blocking for country: {country}")
 
         q_mask = df_queries["country_clean"] == country
         t_mask = df_targets["country_clean"] == country
@@ -341,77 +398,43 @@ def faiss_blocking_by_country(
 
         log.info(f"    Queries: {len(q_df):,}, Targets: {len(t_df):,}")
 
-        # Try to load cached embeddings
-        emb_q_path = config.EMBEDDINGS_DIR / f"emb_query_{country}.npy"
-        emb_t_path = config.EMBEDDINGS_DIR / f"emb_target_{country}.npy"
+        emb_targets = global_emb_targets[t_mask]
+        emb_queries = global_emb_queries[q_mask]
 
-        if emb_q_path.exists() and emb_t_path.exists():
-            log.info("    Loading cached embeddings...")
-            emb_queries = np.load(emb_q_path)
-            emb_targets = np.load(emb_t_path)
-        else:
-            q_texts = q_df["name_addr"].fillna("").values
-            t_texts = t_df["name_addr"].fillna("").values
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        log.info(f"    Moving target embeddings to {device}...")
+        target_tensor = torch.tensor(emb_targets, dtype=torch.float16, device=device)
 
-            emb_targets = compute_embeddings(t_texts, save_path=emb_t_path)
-            emb_queries = compute_embeddings(q_texts, save_path=emb_q_path)
-
-        dim = emb_targets.shape[1]
-        n_targets = len(emb_targets)
-
-        # Build FAISS index
-        log.info(f"    Building FAISS IVF index (dim={dim}, n={n_targets:,})...")
-        nlist = min(config.FAISS_NLIST, n_targets // 40)
-        nlist = max(nlist, 1)
-
-        quantizer = faiss.IndexFlatIP(dim)
-        index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
-
-        # Use GPU if available
-        use_gpu = torch.cuda.is_available()
-        if use_gpu:
-            try:
-                res = faiss.StandardGpuResources()
-                index = faiss.index_cpu_to_gpu(res, 0, index)
-                log.info("    Using FAISS GPU index")
-            except Exception as e:
-                log.warning(f"    GPU FAISS failed ({e}), using CPU")
-                use_gpu = False
-                index = faiss.IndexIVFFlat(quantizer, dim, nlist,
-                                           faiss.METRIC_INNER_PRODUCT)
-
-        # Train and add
-        train_subset = emb_targets[:min(500_000, n_targets)]
-        index.train(train_subset)
-        index.add(emb_targets)
-        index.nprobe = config.FAISS_NPROBE
-
-        # Search in batches
         t_eids = t_df["entity_id"].values
         q_eids = q_df["entity_id"].values
 
-        search_batch = 10_000
+        search_batch = 500
         for start in tqdm(range(0, len(emb_queries), search_batch),
-                          desc=f"  FAISS search {country}", mininterval=5):
+                          desc=f"  Dense search {country}", mininterval=5):
             end = min(start + search_batch, len(emb_queries))
             batch_q = emb_queries[start:end]
 
-            scores, indices = index.search(batch_q, top_k)
+            query_tensor = torch.tensor(batch_q, dtype=torch.float16, device=device)
+            sim_matrix = torch.matmul(query_tensor, target_tensor.T)
+
+            k = min(top_k, sim_matrix.shape[1])
+            scores, indices = torch.topk(sim_matrix, k=k, dim=1)
+            indices_np = indices.cpu().numpy()
 
             for i in range(len(batch_q)):
                 q_eid = q_eids[start + i]
                 if q_eid not in candidates:
                     candidates[q_eid] = set()
 
-                for j in range(top_k):
-                    t_idx = indices[i, j]
-                    if t_idx >= 0:  # FAISS returns -1 for missing neighbors
-                        candidates[q_eid].add(t_eids[t_idx])
+                for j in range(k):
+                    t_idx = indices_np[i, j]
+                    candidates[q_eid].add(t_eids[t_idx])
 
         # Cleanup
-        del index, emb_targets, emb_queries
+        del target_tensor, emb_targets, emb_queries
         gc.collect()
-        if use_gpu:
+        if device == 'cuda':
             torch.cuda.empty_cache()
 
     return candidates
@@ -429,6 +452,12 @@ def run_blocking(split: str = "train",
 
     Returns: {s1_entity_id: set(candidate_entity_ids)}
     """
+    save_path = config.BLOCKING_DIR / f"{split}_candidates.pkl"
+    if save_path.exists():
+        log.info(f"Loading existing final candidates for {split} from {save_path.name}...")
+        with open(save_path, "rb") as f:
+            return pickle.load(f)
+
     # Load preprocessed data
     log.info(f"Loading preprocessed {split} data...")
     df_s1 = load_preprocessed(split, "s1")
@@ -444,29 +473,36 @@ def run_blocking(split: str = "train",
 
     # ── Strategy 1: Inverted Index ──────────────────────────
     log.info("═══ Strategy 1: Inverted Index Blocking ═══")
-    inv_index = build_inverted_index(df_targets)
-    cands_inv = query_inverted_index(
-        df_s1, inv_index, target_eids,
-        max_candidates=config.MAX_CANDIDATES_PER_ENTITY
-    )
-    del inv_index
+    inv_cands_path = f"output/inv_candidates_{split}.joblib"
+    if os.path.exists(inv_cands_path):
+        log.info("  Loading inverted index candidates from cache...")
+        cands_inv = joblib.load(inv_cands_path)
+    else:
+        inv_index = build_inverted_index(df_targets, split=split)
+        cands_inv = query_inverted_index(
+            df_s1, inv_index, target_eids,
+            max_candidates=config.MAX_CANDIDATES_PER_ENTITY
+        )
+        del inv_index
+        joblib.dump(cands_inv, inv_cands_path)
+        
     gc.collect()
     log.info(f"  Inverted index candidates: "
              f"{sum(len(v) for v in cands_inv.values()):,} pairs")
     log_memory()
 
-    # ── Strategy 2: TF-IDF Blocking ─────────────────────────
-    log.info("═══ Strategy 2: TF-IDF Character N-gram Blocking ═══")
-    cands_tfidf = tfidf_blocking_by_country(df_s1, df_targets, top_k=20)
-    log.info(f"  TF-IDF candidates: "
-             f"{sum(len(v) for v in cands_tfidf.values()):,} pairs")
-    log_memory()
-
-    # ── Strategy 3: FAISS Dense Blocking ────────────────────
-    log.info("═══ Strategy 3: FAISS Dense Blocking ═══")
-    cands_faiss = faiss_blocking_by_country(df_s1, df_targets, top_k=config.FAISS_TOP_K)
-    log.info(f"  FAISS candidates: "
-             f"{sum(len(v) for v in cands_faiss.values()):,} pairs")
+    # ── Strategy 2: PyTorch Dense Blocking ────────────────────
+    log.info("═══ Strategy 2: PyTorch Dense Blocking ═══")
+    dense_cands_path = f"output/dense_candidates_{split}.joblib"
+    if os.path.exists(dense_cands_path):
+        log.info("  Loading dense candidates from cache...")
+        cands_dense = joblib.load(dense_cands_path)
+    else:
+        cands_dense = dense_blocking_by_country(df_s1, df_targets, top_k=config.FAISS_TOP_K, split=split)
+        joblib.dump(cands_dense, dense_cands_path)
+        
+    log.info(f"  Dense candidates: "
+             f"{sum(len(v) for v in cands_dense.values()):,} pairs")
     log_memory()
 
     # ── Union all strategies ────────────────────────────────
@@ -477,8 +513,7 @@ def run_blocking(split: str = "train",
     for s1_eid in tqdm(all_s1_eids, desc="Merging candidates", mininterval=10):
         merged = set()
         merged.update(cands_inv.get(s1_eid, set()))
-        merged.update(cands_tfidf.get(s1_eid, set()))
-        merged.update(cands_faiss.get(s1_eid, set()))
+        merged.update(cands_dense.get(s1_eid, set()))
 
         # Cap at max candidates (keep all if under limit)
         if len(merged) > config.MAX_CANDIDATES_PER_ENTITY * 2:
@@ -503,6 +538,16 @@ def run_blocking(split: str = "train",
         with open(save_path, "wb") as f:
             pickle.dump(final_candidates, f, protocol=pickle.HIGHEST_PROTOCOL)
         log.info(f"  Saved to {save_path.name}")
+        
+        # Output TSV for candidates
+        tsv_path = Path(f"output/candidate_pairs_{split}.tsv")
+        tsv_path.parent.mkdir(exist_ok=True, parents=True)
+        with open(tsv_path, "w", encoding="utf-8") as f:
+            f.write("source1_entity_id\tcandidate_entity_ids\n")
+            for q_eid, c_eids in final_candidates.items():
+                c_str = str(list(c_eids))
+                f.write(f"{q_eid}\t{c_str}\n")
+        log.info(f"  Saved TSV to {tsv_path}")
 
     return final_candidates
 

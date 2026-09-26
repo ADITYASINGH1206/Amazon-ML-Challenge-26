@@ -365,6 +365,11 @@ def run_preprocessing(split: str = "train"):
         paths = {"s1": config.TEST_S1, "s2": config.TEST_S2, "s3": config.TEST_S3}
 
     for label, path in paths.items():
+        out_path = config.PREPROCESSED_DIR / f"{split}_{label}.parquet"
+        if out_path.exists():
+            log.info(f"Preprocessed file {out_path.name} already exists. Skipping.")
+            continue
+
         log.info(f"Processing {split}_{label}...")
         df = load_source(path)
         df = preprocess_dataframe(df)

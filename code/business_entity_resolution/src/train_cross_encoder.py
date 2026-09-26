@@ -373,6 +373,12 @@ class CrossEncoderScorer:
 @timed
 def run_cross_encoder_training():
     """Full cross-encoder training pipeline."""
+    # Check if model already exists
+    ce_dir = config.MODELS_DIR / "cross_encoder"
+    if ce_dir.exists():
+        log.info(f"Cross-encoder model already exists at {ce_dir}. Skipping training.")
+        return
+
     # Load labeled training features
     train_path = config.FEATURES_DIR / "train_features_labeled.parquet"
     if not train_path.exists():

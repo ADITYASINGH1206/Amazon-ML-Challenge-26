@@ -65,7 +65,7 @@ Since intermediate artifacts (like processed data, features, and models) are sav
 
 ```bash
 python run_pipeline.py preprocess    # Stage 0: Text normalization
-python run_pipeline.py block         # Stage 1: Candidate generation (Inverted Index, TF-IDF, FAISS)
+python run_pipeline.py block         # Stage 1: Candidate generation (Inverted Index, TF-IDF, PyTorch Dense)
 python run_pipeline.py features      # Stage 2: Feature engineering (Cosine, Jaro-Winkler, etc.)
 python run_pipeline.py train_lgbm    # Stage 3a: Fast filter training
 python run_pipeline.py train_ce      # Stage 3b: DeBERTa Cross-encoder fine-tuning
