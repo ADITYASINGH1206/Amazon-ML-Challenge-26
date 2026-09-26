@@ -269,6 +269,7 @@ def tfidf_blocking_by_country(
         sim_sparse = sp_matmul_topn(A, B_T, top_n=top_k, n_threads=n_jobs)
         
         q_eids = q_df["entity_id"].values
+        t_eids = t_df["entity_id"].values
         
         log.info("    Extracting candidates...")
         # sim_sparse is a CSR matrix
@@ -557,7 +558,7 @@ def run_blocking(split: str = "train",
         with open(tsv_path, "w", encoding="utf-8") as f:
             f.write("source1_entity_id\tcandidate_entity_ids\n")
             for q_eid, c_eids in final_candidates.items():
-                c_str = str(list(c_eids))
+                c_str = ",".join(sorted(c_eids)) if c_eids else ""
                 f.write(f"{q_eid}\t{c_str}\n")
         log.info(f"  Saved TSV to {tsv_path}")
 

@@ -55,28 +55,30 @@ def lgbm_cascade_filter(
     if top_k is None:
         top_k = config.LGBM_CASCADE_TOP_K
 
-    feature_cols = get_feature_columns()
-    X = df_features[feature_cols].values
+    if "lgbm_prob" not in df_features.columns:
+        feature_cols = get_feature_columns()
+        X = df_features[feature_cols].to_numpy(dtype=np.float32, copy=False)
+        log.info(f"  Scoring {len(X):,} pairs with LightGBM in batches...")
+        probs = np.zeros(len(X), dtype=np.float32)
+        batch_sz = 5_000_000
+        for i in range(0, len(X), batch_sz):
+            end_i = min(i + batch_sz, len(X))
+            probs[i:end_i] = model.predict_proba(X[i:end_i])[:, 1]
+        df_features = df_features[["s1_id", "s2s3_id"]].copy()
+        df_features["lgbm_prob"] = probs
+        del X, probs
+        gc.collect()
 
-    log.info(f"  Scoring {len(X):,} pairs with LightGBM...")
-    probs = model.predict_proba(X)[:, 1]
-    df_features = df_features.copy()
-    df_features["lgbm_prob"] = probs
-
-    # Keep top-K per S1 entity
+    # Ultra-fast vectorized top-k per S1 entity using pandas C implementation
     log.info(f"  Filtering to top-{top_k} per S1 entity...")
-    filtered_indices = []
-
-    for s1_id, group in df_features.groupby("s1_id"):
-        if len(group) <= top_k:
-            filtered_indices.extend(group.index.tolist())
-        else:
-            top_indices = group.nlargest(top_k, "lgbm_prob").index.tolist()
-            filtered_indices.extend(top_indices)
-
-    df_filtered = df_features.loc[filtered_indices].reset_index(drop=True)
-    log.info(f"  After cascade: {len(df_filtered):,} pairs "
-             f"(from {len(df_features):,})")
+    df_filtered = (
+        df_features[["s1_id", "s2s3_id", "lgbm_prob"]]
+        .sort_values(["s1_id", "lgbm_prob"], ascending=[True, False])
+        .groupby("s1_id", as_index=False)
+        .head(top_k)
+        .reset_index(drop=True)
+    )
+    log.info(f"  After cascade: {len(df_filtered):,} pairs (from {len(df_features):,})")
 
     return df_filtered
 
@@ -98,45 +100,41 @@ def cross_encoder_rerank(
     Input: pairs filtered by LightGBM cascade
     Output: same DataFrame with added 'ce_prob' column
     """
-    # Build text lookup
-    s1_text = {}
-    for _, row in df_s1.iterrows():
-        name = _safe_str(row.get("name_clean", ""))
-        addr = _safe_str(row.get("addr_clean", ""))
-        s1_text[row["entity_id"]] = f"{name}, {addr}" if addr else name
+    log.info("Building text lookup for cross-encoder re-ranking...")
+    s1_text = dict(zip(df_s1["entity_id"], df_s1["name_addr"].fillna("")))
+    target_text = dict(zip(df_targets["entity_id"], df_targets["name_addr"].fillna("")))
 
-    target_text = {}
-    for _, row in df_targets.iterrows():
-        name = _safe_str(row.get("name_clean", ""))
-        addr = _safe_str(row.get("addr_clean", ""))
-        target_text[row["entity_id"]] = f"{name}, {addr}" if addr else name
+    s1_ids = df_filtered["s1_id"].values
+    t_ids = df_filtered["s2s3_id"].values
+    lgbm_probs = df_filtered["lgbm_prob"].values
 
-    # Build text pairs
+    # Pre-filter: only send candidates with lgbm_prob >= 0.05 to Cross-Encoder
+    # (Candidates below 0.05 cannot cross threshold >= 0.55 anyway)
+    ce_candidate_mask = lgbm_probs >= 0.05
+
     text_pairs = []
-    valid_indices = []
-    for idx, row in df_filtered.iterrows():
-        s1_id = row["s1_id"]
-        s2s3_id = row["s2s3_id"]
+    pair_indices = []
+    for idx, (s1, t, eligible) in enumerate(zip(s1_ids, t_ids, ce_candidate_mask)):
+        if eligible:
+            ta = s1_text.get(s1, "")
+            tb = target_text.get(t, "")
+            if ta and tb:
+                text_pairs.append((ta, tb))
+                pair_indices.append(idx)
 
-        text_a = s1_text.get(s1_id, "")
-        text_b = target_text.get(s2s3_id, "")
+    log.info(f"  Scoring {len(text_pairs):,} promising pairs with cross-encoder (skipped {len(df_filtered) - len(text_pairs):,} low-probability candidates)...")
 
-        if text_a and text_b:
-            text_pairs.append((text_a, text_b))
-            valid_indices.append(idx)
-
-    log.info(f"  Scoring {len(text_pairs):,} pairs with cross-encoder...")
-
+    ce_probs_all = np.zeros(len(df_filtered), dtype=np.float32)
     if len(text_pairs) > 0:
-        ce_probs = scorer.score_pairs(text_pairs)
-    else:
-        ce_probs = np.array([])
+        ce_scores = scorer.score_pairs(text_pairs)
+        ce_probs_all[pair_indices] = ce_scores
+        del text_pairs, ce_scores
 
-    # Add cross-encoder scores
     df_filtered = df_filtered.copy()
-    df_filtered["ce_prob"] = 0.0
-    for i, idx in enumerate(valid_indices):
-        df_filtered.loc[idx, "ce_prob"] = float(ce_probs[i])
+    df_filtered["ce_prob"] = ce_probs_all
+
+    del s1_text, target_text, ce_probs_all
+    gc.collect()
 
     return df_filtered
 
@@ -151,7 +149,6 @@ def compute_ensemble_score(lgbm_prob: float, ce_prob: float) -> float:
             config.ENSEMBLE_WEIGHT_CE * ce_prob)
 
 
-@timed
 def apply_thresholding(
     df_scored: pd.DataFrame,
     threshold: float,
@@ -176,40 +173,29 @@ def apply_thresholding(
     if global_dedup is None:
         global_dedup = config.GLOBAL_DEDUP
 
-    # Step 1: Compute ensemble scores
+    # Step 1: Vectorized ensemble scores
     df_scored = df_scored.copy()
     if "ce_prob" in df_scored.columns:
-        df_scored["ensemble_score"] = df_scored.apply(
-            lambda r: compute_ensemble_score(r["lgbm_prob"], r["ce_prob"]),
-            axis=1,
+        df_scored["ensemble_score"] = (
+            config.ENSEMBLE_WEIGHT_LGBM * df_scored["lgbm_prob"].to_numpy(dtype=np.float32) +
+            config.ENSEMBLE_WEIGHT_CE * df_scored["ce_prob"].to_numpy(dtype=np.float32)
         )
     else:
-        df_scored["ensemble_score"] = df_scored["lgbm_prob"]
+        df_scored["ensemble_score"] = df_scored["lgbm_prob"].to_numpy(dtype=np.float32)
 
-    # Step 2: For each S1, collect candidates above threshold
-    raw_predictions = {}
-    for s1_id in all_s1_ids:
-        raw_predictions[s1_id] = set()
+    # Step 2: Vectorized filter of pairs above threshold
+    above_mask = df_scored["ensemble_score"].values >= threshold
+    df_above = df_scored[above_mask]
 
-    for s1_id, group in df_scored.groupby("s1_id"):
-        above_threshold = group[group["ensemble_score"] >= threshold]
-
-        if len(above_threshold) == 0:
-            raw_predictions[s1_id] = set()  # Singleton safeguard
-            continue
-
-        matched = set()
-        scores = above_threshold.set_index("s2s3_id")["ensemble_score"].to_dict()
-
-        for cand_id, score in scores.items():
-            matched.add(cand_id)
-
-        raw_predictions[s1_id] = matched
+    raw_pred_map = defaultdict(set)
+    for s1, s2 in zip(df_above["s1_id"].values, df_above["s2s3_id"].values):
+        raw_pred_map[s1].add(s2)
+    raw_predictions = {s1: raw_pred_map.get(s1, set()) for s1 in all_s1_ids}
 
     # Step 3: Global deduplication (each S2/S3 → at most one S1)
     if global_dedup:
         predictions = _global_dedup_with_margin(
-            df_scored, raw_predictions, threshold, margin_delta
+            df_above, raw_predictions, margin_delta
         )
     else:
         predictions = raw_predictions
@@ -223,29 +209,22 @@ def apply_thresholding(
 
 
 def _global_dedup_with_margin(
-    df_scored: pd.DataFrame,
+    df_above: pd.DataFrame,
     raw_predictions: Dict[str, Set[str]],
-    threshold: float,
     margin_delta: float,
 ) -> Dict[str, Set[str]]:
     """
-    Global deduplication with margin-based confidence.
+    Global deduplication with margin-based confidence in O(N) time.
 
     For each S2/S3 entity claimed by multiple S1 entities:
     - Assign to the S1 with the highest ensemble score
     - Only if margin over the second-highest S1 score > margin_delta
     - Otherwise, don't assign to any S1 (too ambiguous)
     """
-    # Build reverse index: s2s3_id → [(s1_id, score), ...]
+    # Build reverse index directly from df_above (already above threshold!)
     reverse_index = defaultdict(list)
-
-    for s1_id, matches in raw_predictions.items():
-        for s2s3_id in matches:
-            mask = (df_scored["s1_id"] == s1_id) & (df_scored["s2s3_id"] == s2s3_id)
-            matching_rows = df_scored[mask]
-            if len(matching_rows) > 0:
-                score = matching_rows["ensemble_score"].values[0]
-                reverse_index[s2s3_id].append((s1_id, score))
+    for s1, s2, score in zip(df_above["s1_id"].values, df_above["s2s3_id"].values, df_above["ensemble_score"].values):
+        reverse_index[s2].append((s1, float(score)))
 
     # Resolve conflicts
     assignments = {}  # s2s3_id → s1_id (or None)
@@ -408,13 +387,13 @@ def run_inference(split: str = "test"):
         )
 
         log.info("Extracting features for all candidates...")
-        df_features = extract_features_for_pairs(
+        extract_features_for_pairs(
             candidates, df_s1, df_targets,
             emb_s1, emb_targets, s1_map, t_map,
+            output_path=features_path,
         )
-        
-        df_features.to_parquet(features_path, index=False)
         log.info(f"Features saved to {features_path.name}")
+        df_features = pd.read_parquet(features_path)
 
         del emb_s1, emb_targets, s1_map, t_map
         gc.collect()

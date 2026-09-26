@@ -74,11 +74,11 @@ def prepare_cross_encoder_data(
     df_s1: pd.DataFrame,
     df_targets: pd.DataFrame,
     ground_truth: Dict[str, Set[str]],
-    lgbm_model,
+    lgbm_model=None,
     max_pairs: int = None,
 ) -> Tuple[List[Tuple[str, str]], List[int]]:
     """
-    Prepare training data for the cross-encoder.
+    Prepare training data for the cross-encoder using ultra-fast vectorized filtering.
 
     Strategy:
     - Positive pairs: true matches from ground truth
@@ -90,99 +90,74 @@ def prepare_cross_encoder_data(
     if max_pairs is None:
         max_pairs = config.CE_MAX_TRAIN_PAIRS
 
-    # Build lookup
-    s1_lookup = {}
-    for _, row in df_s1.iterrows():
-        s1_lookup[row["entity_id"]] = row
-
-    target_lookup = {}
-    for _, row in df_targets.iterrows():
-        target_lookup[row["entity_id"]] = row
-
-    def make_text(row):
-        name = _safe_str(row.get("name_clean", ""))
-        addr = _safe_str(row.get("addr_clean", ""))
-        return f"{name}, {addr}" if addr else name
-
-    # Collect positive and negative pairs
-    positives = []
-    hard_negatives = []
-    easy_negatives = []
-
-    # Use the labeled features DataFrame
-    from src.features import get_feature_columns
-    feature_cols = get_feature_columns()
+    # If lgbm_prob is missing, compute it; otherwise use the precomputed probabilities
+    if "lgbm_prob" not in df_val_features.columns:
+        from src.features import get_feature_columns
+        feature_cols = get_feature_columns()
+        if all(col in df_val_features.columns for col in feature_cols):
+            X = df_val_features[feature_cols].to_numpy(dtype=np.float32, copy=False)
+            df_val_features = df_val_features.copy()
+            df_val_features["lgbm_prob"] = lgbm_model.predict_proba(X)[:, 1] if lgbm_model else 0.0
+            del X
+        else:
+            df_val_features = df_val_features.copy()
+            df_val_features["lgbm_prob"] = 0.0
 
     if "label" not in df_val_features.columns:
-        # Label if not already done
-        labels = []
-        for _, row in df_val_features.iterrows():
-            s1_id = row["s1_id"]
-            s2s3_id = row["s2s3_id"]
-            true_matches = ground_truth.get(s1_id, set())
-            labels.append(1 if s2s3_id in true_matches else 0)
+        true_matches_set = {(s1, cand) for s1, cands in ground_truth.items() for cand in cands}
         df_val_features = df_val_features.copy()
-        df_val_features["label"] = labels
+        df_val_features["label"] = [
+            1 if (s1, s2) in true_matches_set else 0
+            for s1, s2 in zip(df_val_features["s1_id"], df_val_features["s2s3_id"])
+        ]
+        del true_matches_set
 
-    # Score with LightGBM to find hard negatives
-    X = df_val_features[feature_cols].values
-    probs = lgbm_model.predict_proba(X)[:, 1]
-    df_val_features = df_val_features.copy()
-    df_val_features["lgbm_prob"] = probs
+    log.info("Mining hard negatives and balancing classes via vectorized filtering...")
+    df_pos = df_val_features[df_val_features["label"] == 1]
+    df_hard = df_val_features[(df_val_features["label"] == 0) & (df_val_features["lgbm_prob"] > 0.3)]
+    df_easy = df_val_features[(df_val_features["label"] == 0) & (df_val_features["lgbm_prob"] <= 0.3)]
 
-    for _, row in df_val_features.iterrows():
-        s1_id = row["s1_id"]
-        s2s3_id = row["s2s3_id"]
-        label = int(row["label"])
-        prob = row["lgbm_prob"]
+    log.info(f"  Available positives: {len(df_pos):,}")
+    log.info(f"  Available hard negatives: {len(df_hard):,}")
+    log.info(f"  Available easy negatives: {len(df_easy):,}")
 
-        if s1_id not in s1_lookup or s2s3_id not in target_lookup:
-            continue
-
-        text_a = make_text(s1_lookup[s1_id])
-        text_b = make_text(target_lookup[s2s3_id])
-
-        if label == 1:
-            positives.append((text_a, text_b))
-        elif prob > 0.3:  # Hard negative: LightGBM thought it was a match
-            hard_negatives.append((text_a, text_b))
-        else:
-            easy_negatives.append((text_a, text_b))
-
-    log.info(f"  Positives: {len(positives):,}")
-    log.info(f"  Hard negatives: {len(hard_negatives):,}")
-    log.info(f"  Easy negatives: {len(easy_negatives):,}")
-
-    # Balance: target 1:1 ratio
     max_per_class = max_pairs // 2
+    if len(df_pos) > max_per_class:
+        df_pos = df_pos.sample(n=max_per_class, random_state=config.RANDOM_SEED)
 
-    # Sample positives
-    if len(positives) > max_per_class:
-        random.seed(config.RANDOM_SEED)
-        positives = random.sample(positives, max_per_class)
+    n_pos = len(df_pos)
+    n_hard = min(len(df_hard), int(n_pos * 0.7))
+    n_easy = min(len(df_easy), n_pos - n_hard)
 
-    n_pos = len(positives)
-    n_hard = min(len(hard_negatives), int(n_pos * 0.7))  # 70% hard
-    n_easy = min(len(easy_negatives), n_pos - n_hard)      # 30% easy
+    if len(df_hard) > n_hard:
+        # Sort by highest LightGBM false match confidence to get the hardest negatives
+        df_hard = df_hard.nlargest(n_hard, "lgbm_prob")
+    if len(df_easy) > n_easy:
+        df_easy = df_easy.sample(n=n_easy, random_state=config.RANDOM_SEED)
 
-    random.seed(config.RANDOM_SEED)
-    sampled_hard = random.sample(hard_negatives, n_hard) if n_hard > 0 else []
-    sampled_easy = random.sample(easy_negatives, n_easy) if n_easy > 0 else []
+    df_selected = pd.concat([df_pos, df_hard, df_easy], ignore_index=True)
+    df_selected = df_selected.sample(frac=1.0, random_state=config.RANDOM_SEED).reset_index(drop=True)
 
-    # Combine
-    text_pairs = positives + sampled_hard + sampled_easy
-    labels = [1] * len(positives) + [0] * (len(sampled_hard) + len(sampled_easy))
+    del df_pos, df_hard, df_easy
+    gc.collect()
 
-    # Shuffle
-    combined = list(zip(text_pairs, labels))
-    random.shuffle(combined)
-    text_pairs, labels = zip(*combined) if combined else ([], [])
-    text_pairs = list(text_pairs)
-    labels = list(labels)
+    log.info("Building fast text lookup for sampled pairs...")
+    s1_text = dict(zip(df_s1["entity_id"], df_s1["name_addr"].fillna("")))
+    target_text = dict(zip(df_targets["entity_id"], df_targets["name_addr"].fillna("")))
 
-    log.info(f"  Total training pairs: {len(text_pairs):,} "
-             f"(pos: {sum(labels):,}, neg: {len(labels) - sum(labels):,})")
+    text_pairs = []
+    labels = []
+    for s1, s2, lbl in zip(df_selected["s1_id"], df_selected["s2s3_id"], df_selected["label"]):
+        t1 = s1_text.get(s1, "")
+        t2 = target_text.get(s2, "")
+        if t1 and t2:
+            text_pairs.append((t1, t2))
+            labels.append(int(lbl))
 
+    del df_selected, s1_text, target_text
+    gc.collect()
+
+    log.info(f"  Total training pairs: {len(text_pairs):,} (pos: {sum(labels):,}, neg: {len(labels) - sum(labels):,})")
     return text_pairs, labels
 
 
@@ -195,8 +170,7 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
                         labels: List[int]) -> str:
     """
     Fine-tune cross-encoder and save checkpoint.
-
-    Returns: path to saved model directory
+    Uses batch size 32 with gradient accumulation for guaranteed VRAM safety on RTX 5090.
     """
     from transformers import (
         AutoTokenizer, AutoModelForSequenceClassification,
@@ -214,16 +188,20 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
     )
     model.to(device)
 
+    # Use micro-batch size 32 with grad accum 2 for rock-solid VRAM stability
+    micro_batch_size = min(config.CE_BATCH_SIZE, 32)
+    grad_accum_steps = max(1, config.CE_BATCH_SIZE // micro_batch_size)
+
     # Create dataset
     dataset = EntityPairDataset(
         text_pairs, labels, tokenizer, config.CROSS_ENCODER_MAX_LEN
     )
     dataloader = DataLoader(
         dataset,
-        batch_size=config.CE_BATCH_SIZE,
+        batch_size=micro_batch_size,
         shuffle=True,
         num_workers=0,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
     )
 
     # Optimizer
@@ -234,7 +212,7 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
     )
 
     # Scheduler
-    total_steps = len(dataloader) * config.CE_EPOCHS
+    total_steps = (len(dataloader) // grad_accum_steps) * config.CE_EPOCHS
     warmup_steps = int(total_steps * config.CE_WARMUP_RATIO)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, warmup_steps, total_steps
@@ -250,38 +228,43 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
     for epoch in range(config.CE_EPOCHS):
         total_loss = 0.0
         n_batches = 0
+        optimizer.zero_grad()
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.CE_EPOCHS}")
-        for batch in pbar:
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels_batch = batch["label"].to(device)
-
-            optimizer.zero_grad()
+        for step, batch in enumerate(pbar):
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            labels_batch = batch["label"].to(device, non_blocking=True)
 
             if scaler is not None:
                 with torch.amp.autocast("cuda"):
-                    outputs = model(input_ids=input_ids,
-                                    attention_mask=attention_mask)
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                     logits = outputs.logits.squeeze(-1)
                     loss = loss_fn(logits, labels_batch)
+                    loss = loss / grad_accum_steps
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+
+                if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
             else:
-                outputs = model(input_ids=input_ids,
-                                attention_mask=attention_mask)
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 logits = outputs.logits.squeeze(-1)
                 loss = loss_fn(logits, labels_batch)
+                loss = loss / grad_accum_steps
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
 
-            scheduler.step()
+                if (step + 1) % grad_accum_steps == 0 or (step + 1) == len(dataloader):
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
 
-            total_loss += loss.item()
+            total_loss += loss.item() * grad_accum_steps
             n_batches += 1
             pbar.set_postfix({"loss": f"{total_loss/n_batches:.4f}"})
 
@@ -294,6 +277,12 @@ def train_cross_encoder(text_pairs: List[Tuple[str, str]],
     model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
     log.info(f"  Cross-encoder saved to {save_dir}")
+
+    # Clean up GPU memory
+    del model, optimizer, scheduler, scaler
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     return str(save_dir)
 
