@@ -108,8 +108,8 @@ LGBM_PARAMS = {
     "objective": "binary",
     "metric": "binary_logloss",
     "boosting_type": "gbdt",
-    "n_estimators": 2000,
-    "learning_rate": 0.05,
+    "n_estimators": 3000,
+    "learning_rate": 0.04,
     "num_leaves": 127,
     "max_depth": -1,
     "min_child_samples": 100,
@@ -120,7 +120,7 @@ LGBM_PARAMS = {
     "scale_pos_weight": 1.0,   # will be overridden dynamically
     "n_jobs": -1,
     "verbose": -1,
-    "early_stopping_rounds": 100,
+    "early_stopping_rounds": 150,
 }
 
 # LightGBM cascade: keep top-K candidates per S1 for cross-encoder
@@ -148,13 +148,13 @@ ENSEMBLE_WEIGHT_LGBM = 0.35
 ENSEMBLE_WEIGHT_CE   = 0.65
 
 # Threshold search range for τ
-THRESHOLD_SEARCH_MIN  = 0.55
-THRESHOLD_SEARCH_MAX  = 0.95
-THRESHOLD_SEARCH_STEP = 0.01
+THRESHOLD_SEARCH_MIN  = 0.60
+THRESHOLD_SEARCH_MAX  = 0.98
+THRESHOLD_SEARCH_STEP = 0.005
 
 # Margin-based thresholding: minimum gap between best match score
 # and next-best *conflicting* candidate score to accept a match
-MARGIN_DELTA = 0.10
+MARGIN_DELTA = 0.08
 
 # Global deduplication: each S2/S3 entity assigned to at most one S1
 GLOBAL_DEDUP = True

@@ -264,11 +264,16 @@ def optimize_threshold(
 ) -> float:
     """
     Grid-search the optimal threshold τ maximizing macro F₀.₅ on validation.
+    Also tunes ensemble blend weights if both LightGBM and Cross-Encoder probabilities are present.
     """
     from src.utils import macro_f05
 
     best_f05 = 0.0
     best_tau = 0.5
+    best_w = config.ENSEMBLE_WEIGHT_LGBM
+
+    has_ce = "ce_prob" in df_scored.columns
+    weights = [0.20, 0.35, 0.50, 0.65, 0.80] if has_ce else [1.0]
 
     thresholds = np.arange(
         config.THRESHOLD_SEARCH_MIN,
@@ -276,22 +281,41 @@ def optimize_threshold(
         config.THRESHOLD_SEARCH_STEP,
     )
 
-    for tau in tqdm(thresholds, desc="Threshold search"):
-        predictions = apply_thresholding(
-            df_scored, tau, all_s1_ids,
-            use_margin=True, global_dedup=True,
+    for w in weights:
+        if has_ce:
+            df_scored["ensemble_score"] = (
+                w * df_scored["lgbm_prob"].to_numpy(dtype=np.float32) +
+                (1.0 - w) * df_scored["ce_prob"].to_numpy(dtype=np.float32)
+            )
+        else:
+            df_scored["ensemble_score"] = df_scored["lgbm_prob"].to_numpy(dtype=np.float32)
+
+        for tau in thresholds:
+            predictions = apply_thresholding(
+                df_scored, tau, all_s1_ids,
+                use_margin=True, global_dedup=True,
+            )
+            score = macro_f05(predictions, ground_truth)
+
+            if score > best_f05:
+                best_f05 = score
+                best_tau = tau
+                best_w = w
+
+    log.info(f"  Optimal parameters: weight_lgbm = {best_w:.2f}, τ = {best_tau:.3f}, F₀.₅ = {best_f05:.4f}")
+
+    # Re-apply best weight to df_scored
+    if has_ce:
+        df_scored["ensemble_score"] = (
+            best_w * df_scored["lgbm_prob"].to_numpy(dtype=np.float32) +
+            (1.0 - best_w) * df_scored["ce_prob"].to_numpy(dtype=np.float32)
         )
-        score = macro_f05(predictions, ground_truth)
-
-        if score > best_f05:
-            best_f05 = score
-            best_tau = tau
-
-    log.info(f"  Optimal threshold: τ = {best_tau:.3f}, F₀.₅ = {best_f05:.4f}")
 
     # Save
     with open(config.MODELS_DIR / "optimal_threshold.pkl", "wb") as f:
         pickle.dump(best_tau, f)
+    with open(config.MODELS_DIR / "optimal_ensemble_weight.pkl", "wb") as f:
+        pickle.dump(best_w, f)
 
     return best_tau
 
@@ -429,13 +453,27 @@ def run_inference(split: str = "test"):
 
     # ── Load optimal threshold ──────────────────────────
     threshold_path = config.MODELS_DIR / "optimal_threshold.pkl"
+    lgbm_threshold_path = config.MODELS_DIR / "lgbm_threshold.pkl"
     if threshold_path.exists():
         with open(threshold_path, "rb") as f:
             threshold = pickle.load(f)
-        log.info(f"Using saved threshold: τ = {threshold:.3f}")
+        log.info(f"Using saved optimal threshold: τ = {threshold:.3f}")
+    elif lgbm_threshold_path.exists():
+        with open(lgbm_threshold_path, "rb") as f:
+            threshold = pickle.load(f)
+        log.info(f"Using saved LightGBM threshold: τ = {threshold:.3f}")
     else:
         threshold = 0.75  # Conservative default
         log.warning(f"No saved threshold found. Using default: τ = {threshold:.3f}")
+
+    # ── Load optimal ensemble weights ───────────────────
+    weight_path = config.MODELS_DIR / "optimal_ensemble_weight.pkl"
+    if weight_path.exists():
+        with open(weight_path, "rb") as f:
+            w_lgbm = pickle.load(f)
+        config.ENSEMBLE_WEIGHT_LGBM = w_lgbm
+        config.ENSEMBLE_WEIGHT_CE = 1.0 - w_lgbm
+        log.info(f"Using saved ensemble weight: LightGBM = {w_lgbm:.2f}, Cross-Encoder = {1.0 - w_lgbm:.2f}")
 
     # ── Apply thresholding ──────────────────────────────
     log.info("Applying margin-based thresholding + global dedup...")

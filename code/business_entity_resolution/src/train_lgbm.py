@@ -258,16 +258,16 @@ def run_lgbm_training():
     df_train_ids["lgbm_prob"] = train_probs
     del train_probs
     
+    # Evaluate and compute validation probabilities
+    evaluate_lgbm_on_val(model, X_val, df_val_ids, gt)
+
     # Save the lightweight ID-only dataframes (No features needed, drastically saves disk & RAM)
     df_val_ids.to_parquet(config.FEATURES_DIR / "val_features.parquet", index=False)
     df_train_ids.to_parquet(config.FEATURES_DIR / "train_features_labeled.parquet", index=False)
 
     # Clean up massive training arrays
-    del X_train, y_train
+    del X_train, y_train, X_val, y_val
     gc.collect()
-
-    # Evaluate
-    evaluate_lgbm_on_val(model, X_val, df_val_ids, gt)
 
     return model
 
