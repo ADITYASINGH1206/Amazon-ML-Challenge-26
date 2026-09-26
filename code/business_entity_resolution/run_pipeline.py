@@ -162,6 +162,65 @@ def run_all():
     log.info(f"{'='*60}")
 
 
+@timed
+def stage_clean(clean_all: bool = False):
+    """Remove previous blocking, feature, and model artifacts to force full re-run.
+    Preserves text embeddings (*.npy) and preprocessed text by default to save 30+ minutes.
+    Pass 'all' (python run_pipeline.py clean all) to wipe everything including embeddings.
+    """
+    import shutil
+    from src import config
+
+    clean_dirs = [
+        config.BLOCKING_DIR,
+        config.FEATURES_DIR,
+        config.MODELS_DIR,
+    ]
+    for d in clean_dirs:
+        if d.exists() and d.is_dir():
+            for item in d.glob("*"):
+                try:
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+                except Exception as e:
+                    log.warning(f"Could not remove {item}: {e}")
+            log.info(f"Cleaned {d}")
+
+    # Clean output directories (inverted indexes, candidate caches, temp indexes)
+    output_dirs = [config.CODE_DIR / "output", Path("output")]
+    cleaned_output = set()
+    for out_dir in output_dirs:
+        resolved = out_dir.resolve()
+        if resolved in cleaned_output:
+            continue
+        cleaned_output.add(resolved)
+        if out_dir.exists() and out_dir.is_dir():
+            for item in out_dir.glob("*"):
+                # Preserve dense embeddings .npy unless clean_all is requested
+                if not clean_all and item.name.endswith(".npy"):
+                    log.info(f"Preserving cached dense embeddings: {item.name}")
+                    continue
+                try:
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+                except Exception as e:
+                    log.warning(f"Could not remove {item}: {e}")
+            log.info(f"Cleaned {out_dir}")
+
+    if clean_all:
+        if config.PREPROCESSED_DIR.exists():
+            shutil.rmtree(config.PREPROCESSED_DIR)
+            config.PREPROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+            log.info("Cleaned preprocessed data.")
+        log.info("Complete clean finished! All artifacts, embeddings, and preprocessed data removed.")
+    else:
+        log.info("Artifacts cleaned successfully! Embeddings and preprocessed data preserved.")
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
@@ -174,6 +233,7 @@ def main():
         print("  train_ce      Stage 3b: Cross-encoder fine-tuning")
         print("  validate      Threshold optimization on validation")
         print("  infer         Full inference on test data")
+        print("  clean         Remove previous blocking/feature/model cache")
         sys.exit(0)
 
     stage = sys.argv[1].lower()
@@ -187,6 +247,7 @@ def main():
         "train_ce": stage_train_cross_encoder,
         "validate": stage_validate,
         "infer": stage_infer,
+        "clean": stage_clean,
     }
 
     if stage not in dispatch:
@@ -194,7 +255,11 @@ def main():
         print(f"Available stages: {', '.join(dispatch.keys())}")
         sys.exit(1)
 
-    dispatch[stage]()
+    if stage == "clean":
+        clean_all = len(sys.argv) > 2 and sys.argv[2].lower() in ("all", "--all", "-a")
+        stage_clean(clean_all=clean_all)
+    else:
+        dispatch[stage]()
 
 
 if __name__ == "__main__":
