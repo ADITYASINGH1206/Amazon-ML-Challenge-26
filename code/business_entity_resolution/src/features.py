@@ -292,12 +292,14 @@ def extract_pair_features(
 
 def _process_feature_chunk(chunk_path: str, idf_name: Dict[str, float], idf_addr: Dict[str, float], idf_combined: Dict[str, float]) -> str:
     """Top-level worker function for extracting features from a parquet chunk on disk."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     df_chunk = pd.read_parquet(chunk_path)
-    
-    # Preallocate a highly memory-efficient float32 numpy array to avoid Python list overhead
+    n_rows = len(df_chunk)
     n_features = len(FEATURE_NAMES)
-    feats_matrix = np.zeros((len(df_chunk), n_features), dtype=np.float32)
-    
+    feats_matrix = np.zeros((n_rows, n_features), dtype=np.float32)
+
     for i, row in enumerate(df_chunk.itertuples(index=False)):
         feats_matrix[i, :] = extract_pair_features(
             str(row.n1), str(row.a1), str(row.na1),
@@ -308,28 +310,34 @@ def _process_feature_chunk(chunk_path: str, idf_name: Dict[str, float], idf_addr
             idf_name, idf_addr, idf_combined,
             row.emb_cos
         )
-        
-    df_res = pd.DataFrame(feats_matrix, columns=[f"f_{i}" for i in range(n_features)])
-    
-    # Use PyArrow strings to massively reduce RAM footprint of string columns
-    df_res.insert(0, "s1_id", df_chunk["s1_id"].astype("string[pyarrow]").values)
-    df_res.insert(1, "s2s3_id", df_chunk["s2s3_id"].astype("string[pyarrow]").values)
-    
+
+    # Build PyArrow Table directly from NumPy arrays — zero Fortran copy, zero pandas DataFrame overhead!
+    arrays = [
+        pa.array(df_chunk["s1_id"].astype(str).values),
+        pa.array(df_chunk["s2s3_id"].astype(str).values),
+    ]
+    names = ["s1_id", "s2s3_id"]
+
+    for col_idx in range(n_features):
+        arrays.append(pa.array(feats_matrix[:, col_idx], type=pa.float32()))
+        names.append(f"f_{col_idx}")
+
     del df_chunk, feats_matrix
     gc.collect()
-    
-    # Save the result directly to disk to prevent joblib from hoarding RAM
+
     out_path = chunk_path.replace(".parquet", "_out.parquet")
-    df_res.to_parquet(out_path)
-    del df_res
+    table = pa.Table.from_arrays(arrays, names=names)
+    pq.write_table(table, out_path, compression="snappy")
+
+    del table, arrays, names
     gc.collect()
-    
-    # Clean up the input temp file
+
+    # Clean up the input temp file immediately
     try:
         Path(chunk_path).unlink(missing_ok=True)
     except:
         pass
-        
+
     return out_path
 
 @timed
@@ -345,11 +353,21 @@ def extract_features_for_pairs(
 ) -> pd.DataFrame:
     """
     Extract features for all candidate pairs in parallel using loky multiprocessing.
-    Memory-guaranteed: streams pairs in 100k chunks directly to disk without ever
-    creating full 70M pair DataFrames in RAM, and streams output via ParquetWriter.
+    Memory-guaranteed: streams pairs in 50k chunks directly to disk without ever
+    creating full pair DataFrames in RAM, and streams output via ParquetWriter.
     """
     import os
     import pyarrow.parquet as pq
+
+    # Clean up any leftover temporary chunk files from interrupted runs
+    tmp_dir = Path("tmp_feature_chunks")
+    if tmp_dir.exists():
+        for old_f in tmp_dir.glob("*.parquet"):
+            try:
+                old_f.unlink()
+            except:
+                pass
+    tmp_dir.mkdir(exist_ok=True)
 
     # Compute IDF
     log.info("Computing IDF scores...")
@@ -399,12 +417,10 @@ def extract_features_for_pairs(
     del df_s1, df_targets
     gc.collect()
 
-    log.info("Dumping chunk batches to disk in lightweight 100k streams...")
+    log.info("Dumping chunk batches to disk in lightweight 50k streams...")
     chunk_paths = []
-    tmp_dir = Path("tmp_feature_chunks")
-    tmp_dir.mkdir(exist_ok=True)
 
-    CHUNK_SIZE = 100_000
+    CHUNK_SIZE = 50_000
     chunk_idx = 0
     curr_s1_batch = []
     curr_s2_batch = []
@@ -454,7 +470,7 @@ def extract_features_for_pairs(
         del chunk_df, arr_s1, arr_s2, idx1, idx2, emb_cos
         return str(path)
 
-    # Stream candidates directly into 100k disk chunks (ZERO memory accumulation!)
+    # Stream candidates directly into 50k disk chunks (ZERO memory accumulation!)
     pbar = tqdm(total=total_pairs, desc="Writing temp disk chunks", mininterval=5)
     for s1_eid, cand_set in candidates.items():
         for cand_eid in cand_set:
@@ -485,8 +501,8 @@ def extract_features_for_pairs(
     gc.collect()
 
     import joblib
-    # Restrict to at most 16 workers to keep aggregate worker RAM under ~3GB
-    max_workers = min(os.cpu_count() or 4, 16)
+    # Restrict to at most 10 workers to keep aggregate worker RAM under ~500MB
+    max_workers = min(os.cpu_count() or 4, 10)
     log.info(f"Launching Loky workers with {max_workers} processes across {len(chunk_paths)} chunks...")
 
     out_paths = joblib.Parallel(n_jobs=max_workers, batch_size=1, backend="loky")(
