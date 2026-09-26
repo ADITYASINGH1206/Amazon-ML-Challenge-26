@@ -293,10 +293,13 @@ def extract_pair_features(
 def _process_feature_chunk(chunk_path: str, idf_name: Dict[str, float], idf_addr: Dict[str, float], idf_combined: Dict[str, float]) -> pd.DataFrame:
     """Top-level worker function for extracting features from a parquet chunk on disk."""
     df_chunk = pd.read_parquet(chunk_path)
-    batch_features = []
     
-    for row in df_chunk.itertuples(index=False):
-        feats = extract_pair_features(
+    # Preallocate a highly memory-efficient float32 numpy array to avoid Python list overhead
+    n_features = len(FEATURE_NAMES)
+    feats_matrix = np.zeros((len(df_chunk), n_features), dtype=np.float32)
+    
+    for i, row in enumerate(df_chunk.itertuples(index=False)):
+        feats_matrix[i, :] = extract_pair_features(
             str(row.n1), str(row.a1), str(row.na1),
             str(row.sn1), str(row.pc1), str(row.c1),
             str(row.n2), str(row.a2), str(row.na2),
@@ -305,13 +308,12 @@ def _process_feature_chunk(chunk_path: str, idf_name: Dict[str, float], idf_addr
             idf_name, idf_addr, idf_combined,
             row.emb_cos
         )
-        batch_features.append(feats)
         
-    df_res = pd.DataFrame(batch_features, columns=[f"f_{i}" for i in range(len(FEATURE_NAMES))])
+    df_res = pd.DataFrame(feats_matrix, columns=[f"f_{i}" for i in range(n_features)])
     df_res.insert(0, "s1_id", df_chunk["s1_id"].values)
     df_res.insert(1, "s2s3_id", df_chunk["s2s3_id"].values)
     
-    del df_chunk
+    del df_chunk, feats_matrix
     gc.collect()
     
     # Clean up the temp file
@@ -435,7 +437,8 @@ def extract_features_for_pairs(
     tmp_dir = Path("tmp_feature_chunks")
     tmp_dir.mkdir(exist_ok=True)
     
-    chunk_size = math.ceil(len(df_pairs) / 48)
+    # Increased chunk count to 96 to cut worker RAM spikes in half
+    chunk_size = math.ceil(len(df_pairs) / 96)
     for i, start_idx in enumerate(tqdm(range(0, len(df_pairs), chunk_size), desc="Writing temp disk chunks")):
         chunk = df_pairs.iloc[start_idx:start_idx + chunk_size].copy()
         
