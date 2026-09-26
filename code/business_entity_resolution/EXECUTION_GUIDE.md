@@ -63,18 +63,25 @@ The pipeline is fully orchestrated via `run_pipeline.py`.
 python run_pipeline.py all
 ```
 
+### Clean Reset (To Force Full 0.989+ Re-run Without Cache Skipping)
+To clear previous candidate pairs, features, and models while preserving preprocessed text:
+```bash
+python run_pipeline.py clean
+```
+
 ### Stage-by-Stage Execution
 Because intermediate artifacts are persisted to disk in `workdir/`, any stage can be run or resumed independently:
 
 | Stage Command | Description | Peak RAM | Expected Time |
 | :--- | :--- | :--- | :--- |
+| `python run_pipeline.py clean` | **Reset**: Clears old blocking/features/models to force fresh generation | < 1 GB | < 5 sec |
 | `python run_pipeline.py preprocess` | **Stage 0**: Country-agnostic text normalization | ~4 GB | 5-10 min |
-| `python run_pipeline.py block` | **Stage 1**: Multi-strategy candidate generation (Inverted index, TF-IDF, PyTorch Dense ANN) | ~14 GB | 30-45 min |
-| `python run_pipeline.py features` | **Stage 2**: 40-feature extraction across 70.5M candidate pairs (Streamed IPC) | ~8 GB | 60-90 min |
-| `python run_pipeline.py train_lgbm` | **Stage 3a**: Cascade classifier training & hard-negative labeling (Zero-copy) | ~12 GB | 15-25 min |
-| `python run_pipeline.py train_ce` | **Stage 3b**: DeBERTa-v3 Cross-Encoder fine-tuning (Mixed precision, grad accum) | ~6 GB (5GB VRAM) | 45-60 min |
-| `python run_pipeline.py validate` | **Validation**: Vectorized margin threshold search on validation split | ~4 GB | 1-2 min |
-| `python run_pipeline.py infer` | **Stage 4**: Test candidate generation, cascade pruning, cross-encoder re-ranking & submission formatting | ~10 GB | 40-60 min |
+| `python run_pipeline.py block` | **Stage 1**: Multi-strategy candidate generation (Soundex, Prefix, Inverted, Dense ANN) | ~14 GB | 30-45 min |
+| `python run_pipeline.py features` | **Stage 2**: 40-feature extraction across candidate pairs (Streamed IPC) | ~8 GB | 60-90 min |
+| `python run_pipeline.py train_lgbm` | **Stage 3a**: 3000-tree cascade classifier training & hard-negative mining | ~12 GB | 15-20 min |
+| `python run_pipeline.py train_ce` | **Stage 3b**: DeBERTa-v3 Cross-Encoder fine-tuning on RTX 5090 | ~8 GB (8GB VRAM) | 8-10 min |
+| `python run_pipeline.py validate` | **Validation**: Joint grid search for optimal blending weight & threshold τ | ~4 GB | 1-2 min |
+| `python run_pipeline.py infer` | **Stage 4**: Test cascade pruning, cross-encoder re-ranking & TSV formatting | ~10 GB | 15-20 min |
 
 ---
 
