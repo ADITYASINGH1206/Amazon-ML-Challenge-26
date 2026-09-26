@@ -397,19 +397,27 @@ def run_inference(split: str = "test"):
     del df_cand
 
     # ── Extract features ────────────────────────────────
-    log.info("Loading embeddings for features...")
-    emb_s1, emb_targets, s1_map, t_map = load_embeddings_for_features(
-        split, df_s1, df_targets
-    )
+    features_path = config.FEATURES_DIR / f"{split}_features.parquet"
+    if features_path.exists():
+        log.info(f"Loading cached features from {features_path.name}...")
+        df_features = pd.read_parquet(features_path)
+    else:
+        log.info("Loading embeddings for features...")
+        emb_s1, emb_targets, s1_map, t_map = load_embeddings_for_features(
+            split, df_s1, df_targets
+        )
 
-    log.info("Extracting features for all candidates...")
-    df_features = extract_features_for_pairs(
-        candidates, df_s1, df_targets,
-        emb_s1, emb_targets, s1_map, t_map,
-    )
+        log.info("Extracting features for all candidates...")
+        df_features = extract_features_for_pairs(
+            candidates, df_s1, df_targets,
+            emb_s1, emb_targets, s1_map, t_map,
+        )
+        
+        df_features.to_parquet(features_path, index=False)
+        log.info(f"Features saved to {features_path.name}")
 
-    del emb_s1, emb_targets, s1_map, t_map
-    gc.collect()
+        del emb_s1, emb_targets, s1_map, t_map
+        gc.collect()
 
     if len(df_features) == 0:
         log.warning("No features extracted! Outputting all singletons.")
