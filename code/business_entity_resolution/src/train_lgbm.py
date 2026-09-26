@@ -73,16 +73,33 @@ def prepare_training_data(
     
     feature_cols = get_feature_columns()
     
-    log.info("Slicing into float32 training arrays and aggressively clearing RAM...")
-    X_train = df_features.loc[train_mask, feature_cols].values.astype(np.float32)
+    log.info("Extracting IDs and slicing into float32 training arrays with zero-copy...")
+    s1_arr = df_features["s1_id"].to_numpy()
+    s2_arr = df_features["s2s3_id"].to_numpy()
+
+    df_val_ids = pd.DataFrame({
+        "s1_id": s1_arr[val_mask],
+        "s2s3_id": s2_arr[val_mask],
+        "label": labels[val_mask],
+    })
+    df_train_ids = pd.DataFrame({
+        "s1_id": s1_arr[train_mask],
+        "s2s3_id": s2_arr[train_mask],
+        "label": labels[train_mask],
+    })
+    del s1_arr, s2_arr
+
+    # Extract 2D float32 array directly
+    X = df_features[feature_cols].to_numpy(dtype=np.float32, copy=False)
+    del df_features
+    gc.collect()
+
+    X_train = X[train_mask]
     y_train = labels[train_mask]
-    
-    X_val = df_features.loc[val_mask, feature_cols].values.astype(np.float32)
+    X_val = X[val_mask]
     y_val = labels[val_mask]
-    
-    # We only need the IDs for validation eval
-    df_val_ids = df_features.loc[val_mask, ["s1_id", "s2s3_id", "label"]].copy()
-    df_train_ids = df_features.loc[train_mask, ["s1_id", "s2s3_id", "label"]].copy()
+    del X
+    gc.collect()
     
     log.info(f"  Train: {len(X_train):,} pairs ({y_train.sum():,} pos)")
     log.info(f"  Val:   {len(X_val):,} pairs ({y_val.sum():,} pos)")
@@ -164,13 +181,17 @@ def evaluate_lgbm_on_val(
     val_s1_ids = df_val_ids["s1_id"].unique()
     val_gt = {s1: ground_truth.get(s1, set()) for s1 in val_s1_ids}
 
-    for tau in thresholds:
-        predictions = {}
-        for s1_id in val_s1_ids:
-            mask = (df_val_ids["s1_id"] == s1_id) & (df_val_ids["lgbm_prob"] >= tau)
-            matched = set(df_val_ids.loc[mask, "s2s3_id"].values)
-            predictions[s1_id] = matched
+    from collections import defaultdict
 
+    for tau in thresholds:
+        above_mask = df_val_ids["lgbm_prob"].values >= tau
+        df_above = df_val_ids[above_mask]
+        
+        pred_map = defaultdict(set)
+        for s1, s2 in zip(df_above["s1_id"].values, df_above["s2s3_id"].values):
+            pred_map[s1].add(s2)
+            
+        predictions = {s1: pred_map.get(s1, set()) for s1 in val_s1_ids}
         score = macro_f05(predictions, val_gt)
         if score > best_f05:
             best_f05 = score
@@ -180,11 +201,11 @@ def evaluate_lgbm_on_val(
     log.info(f"  Best LightGBM macro F0.5: {best_f05:.4f}")
 
     # Detailed evaluation at best threshold
-    predictions = {}
-    for s1_id in val_s1_ids:
-        mask = (df_val_ids["s1_id"] == s1_id) & (df_val_ids["lgbm_prob"] >= best_threshold)
-        matched = set(df_val_ids.loc[mask, "s2s3_id"].values)
-        predictions[s1_id] = matched
+    above_best = df_val_ids[df_val_ids["lgbm_prob"].values >= best_threshold]
+    pred_best = defaultdict(set)
+    for s1, s2 in zip(above_best["s1_id"].values, above_best["s2s3_id"].values):
+        pred_best[s1].add(s2)
+    predictions = {s1: pred_best.get(s1, set()) for s1 in val_s1_ids}
 
     eval_results = evaluate_predictions(predictions, val_gt)
     for k, v in eval_results.items():
@@ -224,16 +245,18 @@ def run_lgbm_training():
     # Prepare train/val split directly into highly efficient Numpy Arrays
     X_train, y_train, X_val, y_val, df_train_ids, df_val_ids = prepare_training_data(df_features, gt)
     
-    # Aggressively delete massive master dataframe to avoid OOM
-    del df_features
-    gc.collect()
-
     # Train
     model = train_lightgbm(X_train, y_train, X_val, y_val)
     
-    # Pre-compute train probabilities for cross-encoder hard negative mining
-    log.info("Computing train probabilities for cross-encoder hard negative mining...")
-    df_train_ids["lgbm_prob"] = model.predict_proba(X_train)[:, 1]
+    # Pre-compute train probabilities for cross-encoder hard negative mining in batches
+    log.info("Computing train probabilities for cross-encoder hard negative mining in batches...")
+    train_probs = np.zeros(len(X_train), dtype=np.float32)
+    b_size = 5_000_000
+    for b_start in range(0, len(X_train), b_size):
+        b_end = min(b_start + b_size, len(X_train))
+        train_probs[b_start:b_end] = model.predict_proba(X_train[b_start:b_end])[:, 1]
+    df_train_ids["lgbm_prob"] = train_probs
+    del train_probs
     
     # Save the lightweight ID-only dataframes (No features needed, drastically saves disk & RAM)
     df_val_ids.to_parquet(config.FEATURES_DIR / "val_features.parquet", index=False)

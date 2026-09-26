@@ -73,12 +73,12 @@ def stage_features():
         "train", df_s1, df_targets
     )
 
-    df_features = extract_features_for_pairs(
+    extract_features_for_pairs(
         candidates, df_s1, df_targets,
         emb_s1, emb_targets, s1_map, t_map,
+        output_path=out_path,
     )
-    df_features.to_parquet(config.FEATURES_DIR / "train_features.parquet", index=False)
-    log.info(f"Training features saved: {len(df_features):,} pairs")
+    log.info(f"Training features saved to {out_path}")
 
 
 @timed

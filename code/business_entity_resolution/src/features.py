@@ -341,10 +341,16 @@ def extract_features_for_pairs(
     embeddings_targets: Optional[np.ndarray] = None,
     s1_eid_to_idx: Optional[Dict[str, int]] = None,
     target_eid_to_idx: Optional[Dict[str, int]] = None,
+    output_path: Optional[Path] = None,
 ) -> pd.DataFrame:
     """
     Extract features for all candidate pairs in parallel using loky multiprocessing.
+    Memory-guaranteed: streams pairs in 100k chunks directly to disk without ever
+    creating full 70M pair DataFrames in RAM, and streams output via ParquetWriter.
     """
+    import os
+    import pyarrow.parquet as pq
+
     # Compute IDF
     log.info("Computing IDF scores...")
     from itertools import chain
@@ -368,57 +374,10 @@ def extract_features_for_pairs(
 
     gc.collect()
 
-    # Flatten candidates
-    total_pairs = sum(len(v) for v in candidates.items())
+    total_pairs = sum(len(v) for v in candidates.values())
     log.info(f"Extracting features for {total_pairs:,} pairs...")
 
-    s1_ids = []
-    cand_ids = []
-    for s1_eid, cand_set in candidates.items():
-        for cand_eid in cand_set:
-            s1_ids.append(s1_eid)
-            cand_ids.append(cand_eid)
-            
-    df_pairs = pd.DataFrame({"s1_id": s1_ids, "s2s3_id": cand_ids})
-    
-    log.info("Computing embedding cosines...")
-    if embeddings_s1 is not None and embeddings_targets is not None:
-        s1_indices = df_pairs["s1_id"].map(s1_eid_to_idx).fillna(-1).astype(int)
-        t_indices = df_pairs["s2s3_id"].map(target_eid_to_idx).fillna(-1).astype(int)
-        
-        valid_mask = (s1_indices >= 0) & (t_indices >= 0)
-        emb_cos = np.zeros(len(df_pairs), dtype=np.float32)
-        
-        s1_valid = s1_indices[valid_mask].values
-        t_valid = t_indices[valid_mask].values
-        
-        # Chunked vectorized cosine computation to prevent 50+ GiB memory spike
-        valid_idx = np.where(valid_mask)[0]
-        batch_size = 1000000
-        
-        # We need to iterate over the valid arrays, not the indices of df_pairs
-        for i in range(0, len(s1_valid), batch_size):
-            s1_batch = s1_valid[i:i+batch_size]
-            t_batch = t_valid[i:i+batch_size]
-            idx_batch = valid_idx[i:i+batch_size]
-            
-            # Compute directly into emb_cos using float32 precision
-            emb_cos[idx_batch] = (
-                embeddings_s1[s1_batch].astype(np.float32) * 
-                embeddings_targets[t_batch].astype(np.float32)
-            ).sum(axis=1)
-            
-        df_pairs["emb_cos"] = emb_cos
-    else:
-        df_pairs["emb_cos"] = 0.0
-
-    # Do not delete s1_eid_to_idx and target_eid_to_idx yet, we need them for fast string mapping!
-    del embeddings_s1, embeddings_targets
-    gc.collect()
-
     log.info("Building ultra-fast string arrays...")
-    # Convert string columns to native Python object arrays (bypassing PyArrow entirely)
-    # This takes seconds and indexing them takes milliseconds
     s1_cols = {
         'n': df_s1["name_clean"].fillna("").astype(str).to_numpy(dtype=object),
         'a': df_s1["addr_clean"].fillna("").astype(str).to_numpy(dtype=object),
@@ -435,77 +394,140 @@ def extract_features_for_pairs(
         'pc': df_targets["postal"].fillna("").astype(str).to_numpy(dtype=object),
         'c': df_targets["country_clean"].fillna("").astype(str).to_numpy(dtype=object),
     }
-    
+
     # We no longer need the original dataframes
     del df_s1, df_targets
     gc.collect()
 
-    log.info("Dumping chunk batches to disk to prevent multiprocessing memory explosions...")
+    log.info("Dumping chunk batches to disk in lightweight 100k streams...")
     chunk_paths = []
     tmp_dir = Path("tmp_feature_chunks")
     tmp_dir.mkdir(exist_ok=True)
-    
-    # Increased chunk count to 96 to cut worker RAM spikes in half
-    chunk_size = math.ceil(len(df_pairs) / 96)
-    for i, start_idx in enumerate(tqdm(range(0, len(df_pairs), chunk_size), desc="Writing temp disk chunks")):
-        chunk = df_pairs.iloc[start_idx:start_idx + chunk_size].copy()
-        
-        # Map string IDs to integer indices fast
-        idx1 = chunk["s1_id"].map(s1_eid_to_idx).fillna(-1).astype(int).values
-        idx2 = chunk["s2s3_id"].map(target_eid_to_idx).fillna(-1).astype(int).values
-        
-        # Instantly index arrays to populate strings
-        chunk["n1"] = s1_cols['n'][idx1]
-        chunk["a1"] = s1_cols['a'][idx1]
-        chunk["na1"] = s1_cols['na'][idx1]
-        chunk["sn1"] = s1_cols['sn'][idx1]
-        chunk["pc1"] = s1_cols['pc'][idx1]
-        chunk["c1"] = s1_cols['c'][idx1]
 
-        chunk["n2"] = t_cols['n'][idx2]
-        chunk["a2"] = t_cols['a'][idx2]
-        chunk["na2"] = t_cols['na'][idx2]
-        chunk["sn2"] = t_cols['sn'][idx2]
-        chunk["pc2"] = t_cols['pc'][idx2]
-        chunk["c2"] = t_cols['c'][idx2]
-        
-        # Save to disk and clear from RAM immediately
-        path = tmp_dir / f"chunk_{i}.parquet"
-        chunk.to_parquet(path)
-        chunk_paths.append(str(path))
-        
-        del chunk, idx1, idx2
-    
-    # Extremely aggressive cleanup before Loky launch
-    del df_pairs, s1_cols, t_cols, s1_eid_to_idx, target_eid_to_idx
+    CHUNK_SIZE = 100_000
+    chunk_idx = 0
+    curr_s1_batch = []
+    curr_s2_batch = []
+
+    def _flush_batch(b_s1, b_s2, c_idx):
+        if not b_s1:
+            return None
+        arr_s1 = np.array(b_s1, dtype=object)
+        arr_s2 = np.array(b_s2, dtype=object)
+
+        idx1 = np.array([s1_eid_to_idx.get(x, -1) for x in arr_s1], dtype=np.int32)
+        idx2 = np.array([target_eid_to_idx.get(x, -1) for x in arr_s2], dtype=np.int32)
+
+        # Compute cosine similarities for this chunk
+        emb_cos = np.zeros(len(arr_s1), dtype=np.float32)
+        if embeddings_s1 is not None and embeddings_targets is not None:
+            valid = (idx1 >= 0) & (idx2 >= 0)
+            if np.any(valid):
+                s1_v = idx1[valid]
+                t_v = idx2[valid]
+                emb_cos[valid] = (
+                    embeddings_s1[s1_v].astype(np.float32) *
+                    embeddings_targets[t_v].astype(np.float32)
+                ).sum(axis=1)
+
+        # Instantly index arrays to populate strings
+        chunk_df = pd.DataFrame({
+            "s1_id": arr_s1,
+            "s2s3_id": arr_s2,
+            "emb_cos": emb_cos,
+            "n1": s1_cols['n'][idx1],
+            "a1": s1_cols['a'][idx1],
+            "na1": s1_cols['na'][idx1],
+            "sn1": s1_cols['sn'][idx1],
+            "pc1": s1_cols['pc'][idx1],
+            "c1": s1_cols['c'][idx1],
+            "n2": t_cols['n'][idx2],
+            "a2": t_cols['a'][idx2],
+            "na2": t_cols['na'][idx2],
+            "sn2": t_cols['sn'][idx2],
+            "pc2": t_cols['pc'][idx2],
+            "c2": t_cols['c'][idx2],
+        })
+
+        path = tmp_dir / f"chunk_{c_idx}.parquet"
+        chunk_df.to_parquet(path)
+        del chunk_df, arr_s1, arr_s2, idx1, idx2, emb_cos
+        return str(path)
+
+    # Stream candidates directly into 100k disk chunks (ZERO memory accumulation!)
+    pbar = tqdm(total=total_pairs, desc="Writing temp disk chunks", mininterval=5)
+    for s1_eid, cand_set in candidates.items():
+        for cand_eid in cand_set:
+            curr_s1_batch.append(s1_eid)
+            curr_s2_batch.append(cand_eid)
+            if len(curr_s1_batch) >= CHUNK_SIZE:
+                p = _flush_batch(curr_s1_batch, curr_s2_batch, chunk_idx)
+                if p:
+                    chunk_paths.append(p)
+                pbar.update(len(curr_s1_batch))
+                curr_s1_batch = []
+                curr_s2_batch = []
+                chunk_idx += 1
+
+    if curr_s1_batch:
+        p = _flush_batch(curr_s1_batch, curr_s2_batch, chunk_idx)
+        if p:
+            chunk_paths.append(p)
+        pbar.update(len(curr_s1_batch))
+        curr_s1_batch = []
+        curr_s2_batch = []
+        chunk_idx += 1
+    pbar.close()
+
+    # Extremely aggressive cleanup before Loky launch — frees almost all RAM!
+    del candidates, s1_cols, t_cols, s1_eid_to_idx, target_eid_to_idx
+    del embeddings_s1, embeddings_targets
     gc.collect()
 
     import joblib
-    log.info("Launching Loky workers...")
-    
-    out_paths = joblib.Parallel(n_jobs=-1, batch_size=1, backend="loky")(
-        joblib.delayed(_process_feature_chunk)(path, idf_name, idf_addr, idf_combined) 
+    # Restrict to at most 16 workers to keep aggregate worker RAM under ~3GB
+    max_workers = min(os.cpu_count() or 4, 16)
+    log.info(f"Launching Loky workers with {max_workers} processes across {len(chunk_paths)} chunks...")
+
+    out_paths = joblib.Parallel(n_jobs=max_workers, batch_size=1, backend="loky")(
+        joblib.delayed(_process_feature_chunk)(path, idf_name, idf_addr, idf_combined)
         for path in tqdm(chunk_paths, desc="Feature extraction chunks", mininterval=5)
     )
 
-    log.info("Concatenating finished chunks...")
-    chunks_list = []
-    for p in out_paths:
-        if p and Path(p).exists():
-            chunks_list.append(pd.read_parquet(p))
-            Path(p).unlink(missing_ok=True)
-            
-    df_features = pd.concat(chunks_list, ignore_index=True) if chunks_list else pd.DataFrame()
-    log.info(f"  Feature matrix shape: {df_features.shape}")
+    # Target output file for streaming merge
+    final_output = output_path if output_path is not None else (config.FEATURES_DIR / "train_features.parquet")
+    final_output.parent.mkdir(parents=True, exist_ok=True)
+
+    log.info(f"Streaming finished feature chunks to {final_output.name} via ParquetWriter...")
+    writer = None
+    total_written = 0
+
+    try:
+        for p in tqdm(out_paths, desc="Merging output chunks to parquet"):
+            if p and Path(p).exists():
+                table = pq.read_table(p)
+                total_written += table.num_rows
+                if writer is None:
+                    writer = pq.ParquetWriter(final_output, table.schema, compression="snappy")
+                writer.write_table(table)
+                del table
+                Path(p).unlink(missing_ok=True)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    log.info(f"  Successfully wrote {total_written:,} feature rows to {final_output.name}")
     log_memory()
 
-    # Clean up directory
+    # Clean up temp directory
     try:
         tmp_dir.rmdir()
     except:
         pass
 
-    return df_features
+    if output_path is not None:
+        return pd.DataFrame()
+    return pd.read_parquet(final_output)
 
 def get_feature_columns() -> List[str]:
     """Return list of feature column names in the feature DataFrame."""
@@ -554,8 +576,9 @@ if __name__ == "__main__":
         "train", df_s1, df_targets
     )
 
-    df_features = extract_features_for_pairs(
+    out_path = config.FEATURES_DIR / "train_features.parquet"
+    extract_features_for_pairs(
         candidates, df_s1, df_targets,
         emb_s1, emb_targets, s1_map, t_map,
+        output_path=out_path,
     )
-    df_features.to_parquet(config.FEATURES_DIR / "train_features.parquet", index=False)
