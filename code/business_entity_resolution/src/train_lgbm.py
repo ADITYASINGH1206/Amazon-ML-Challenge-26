@@ -24,7 +24,7 @@ from src.features import get_feature_columns, FEATURE_NAMES
 def prepare_training_data(
     df_features: pd.DataFrame,
     ground_truth: Dict[str, Set[str]],
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, pd.DataFrame, pd.DataFrame]:
     """
     Label candidate pairs using ground truth and split into train/val.
     Returns the NumPy arrays for training, and the id-only DataFrames for validation.
