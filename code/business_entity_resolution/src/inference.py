@@ -151,7 +151,7 @@ def cross_encoder_rerank(
     df_filtered = df_filtered.copy()
     df_filtered["ce_prob"] = ce_probs_all
 
-    del s1_text, target_text, ce_probs_all
+    del ce_probs_all
     gc.collect()
 
     return df_filtered
