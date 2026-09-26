@@ -522,17 +522,29 @@ def run_blocking(split: str = "train",
     log.info("═══ Merging all blocking strategies ═══")
     all_s1_eids = df_s1["entity_id"].values
     final_candidates = {}
+    MAX_C = config.MAX_CANDIDATES_PER_ENTITY  # 50
 
     for s1_eid in tqdm(all_s1_eids, desc="Merging candidates", mininterval=10):
-        merged = set()
-        merged.update(cands_inv.get(s1_eid, set()))
-        merged.update(cands_dense.get(s1_eid, set()))
+        inv_set = cands_inv.get(s1_eid, set())
+        dense_set = cands_dense.get(s1_eid, set())
+        merged = inv_set | dense_set
 
-        # Cap at max candidates (keep all if under limit)
-        if len(merged) > config.MAX_CANDIDATES_PER_ENTITY * 2:
-            # If too many, we can't just randomly drop — keep all for now
-            # The LightGBM cascade will filter anyway
-            pass
+        # Enforce the cap to prevent candidate explosion (70M → ~5M pairs)
+        if len(merged) > MAX_C:
+            # Priority 1: candidates found by BOTH strategies (strongest signal)
+            both = inv_set & dense_set
+            if len(both) >= MAX_C:
+                # Even intersection is too large — just take MAX_C from it
+                merged = set(list(both)[:MAX_C])
+            else:
+                # Keep all intersection candidates, fill rest from dense (higher quality)
+                remaining = MAX_C - len(both)
+                dense_only = dense_set - both
+                inv_only = inv_set - both
+                extras = list(dense_only)[:remaining]
+                if len(extras) < remaining:
+                    extras += list(inv_only)[: remaining - len(extras)]
+                merged = both | set(extras)
 
         final_candidates[s1_eid] = merged
 
