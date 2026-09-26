@@ -361,21 +361,6 @@ def extract_features_for_pairs(
             
     df_pairs = pd.DataFrame({"s1_id": s1_ids, "s2s3_id": cand_ids})
     
-    log.info("Merging text data...")
-    cols_to_merge = ["entity_id", "name_clean", "addr_clean", "name_addr", "street_num", "postal", "country_clean"]
-    
-    df_s1_sub = df_s1[cols_to_merge].copy()
-    df_s1_sub.columns = ["s1_id", "n1", "a1", "na1", "sn1", "pc1", "c1"]
-    
-    df_targets_sub = df_targets[cols_to_merge].copy()
-    df_targets_sub.columns = ["s2s3_id", "n2", "a2", "na2", "sn2", "pc2", "c2"]
-
-    df_pairs = df_pairs.merge(df_s1_sub, on="s1_id", how="inner")
-    df_pairs = df_pairs.merge(df_targets_sub, on="s2s3_id", how="inner")
-    
-    del df_s1_sub, df_targets_sub
-    gc.collect()
-
     log.info("Computing embedding cosines...")
     if embeddings_s1 is not None and embeddings_targets is not None:
         s1_indices = df_pairs["s1_id"].map(s1_eid_to_idx).fillna(-1).astype(int)
@@ -393,14 +378,35 @@ def extract_features_for_pairs(
     else:
         df_pairs["emb_cos"] = 0.0
 
+    log.info("Merging text data chunk-by-chunk to prevent OOM...")
+    cols_to_merge = ["entity_id", "name_clean", "addr_clean", "name_addr", "street_num", "postal", "country_clean"]
+    
+    # Set index for fast joins
+    df_s1_sub = df_s1[cols_to_merge].set_index("entity_id")
+    df_s1_sub.columns = ["n1", "a1", "na1", "sn1", "pc1", "c1"]
+    
+    df_targets_sub = df_targets[cols_to_merge].set_index("entity_id")
+    df_targets_sub.columns = ["n2", "a2", "na2", "sn2", "pc2", "c2"]
+
     import joblib
     
-    log.info("Chunking and launching Loky workers...")
-    chunks = np.array_split(df_pairs, 24)
+    # Chunk df_pairs first
+    base_chunks = np.array_split(df_pairs, 24)
+    populated_chunks = []
     
+    for chunk in base_chunks:
+        # Fast left join on indices
+        c = chunk.join(df_s1_sub, on="s1_id")
+        c = c.join(df_targets_sub, on="s2s3_id")
+        populated_chunks.append(c)
+
+    del df_pairs, df_s1_sub, df_targets_sub, base_chunks
+    gc.collect()
+
+    log.info("Launching Loky workers...")
     results = joblib.Parallel(n_jobs=-1, backend="loky")(
         joblib.delayed(process_feature_chunk)(chunk, idf_name, idf_addr, idf_combined) 
-        for chunk in tqdm(chunks, desc="Feature extraction chunks", mininterval=5)
+        for chunk in tqdm(populated_chunks, desc="Feature extraction chunks", mininterval=5)
     )
 
     df_features = pd.concat([r for r in results if not r.empty], ignore_index=True) if results else pd.DataFrame()
