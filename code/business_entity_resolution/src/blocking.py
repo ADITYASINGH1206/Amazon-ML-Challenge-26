@@ -409,20 +409,32 @@ def dense_blocking_by_country(
         t_eids = t_df["entity_id"].values
         q_eids = q_df["entity_id"].values
 
-        search_batch = 500
+        search_batch = 1000
+        # Pre-allocate similarity matrix buffer to prevent massive memory re-allocations
+        if device == 'cuda':
+            sim_matrix_buffer = torch.empty((search_batch, target_tensor.shape[0]), dtype=torch.float16, device=device)
+        else:
+            sim_matrix_buffer = None
+
         for start in tqdm(range(0, len(emb_queries), search_batch),
                           desc=f"  Dense search {country}", mininterval=5):
             end = min(start + search_batch, len(emb_queries))
+            actual_batch = end - start
             batch_q = emb_queries[start:end]
 
             query_tensor = torch.tensor(batch_q, dtype=torch.float16, device=device)
-            sim_matrix = torch.matmul(query_tensor, target_tensor.T)
+            
+            if sim_matrix_buffer is not None:
+                out_mat = sim_matrix_buffer[:actual_batch]
+                torch.matmul(query_tensor, target_tensor.T, out=out_mat)
+            else:
+                out_mat = torch.matmul(query_tensor, target_tensor.T)
 
-            k = min(top_k, sim_matrix.shape[1])
-            scores, indices = torch.topk(sim_matrix, k=k, dim=1)
+            k = min(top_k, out_mat.shape[1])
+            scores, indices = torch.topk(out_mat, k=k, dim=1)
             indices_np = indices.cpu().numpy()
 
-            for i in range(len(batch_q)):
+            for i in range(actual_batch):
                 q_eid = q_eids[start + i]
                 if q_eid not in candidates:
                     candidates[q_eid] = set()
