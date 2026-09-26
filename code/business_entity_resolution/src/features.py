@@ -436,17 +436,17 @@ def load_embeddings_for_features(split: str, df_s1: pd.DataFrame,
     Returns: (emb_s1, emb_targets, s1_eid_to_idx, target_eid_to_idx)
     """
     import os
-    target_cache = f'output/target_embeddings_{split}.npy'
-    query_cache = f'output/query_embeddings_{split}.npy'
+    target_cache = config.EMBEDDINGS_DIR / f'target_embeddings_{split}.npy'
+    query_cache = config.EMBEDDINGS_DIR / f'query_embeddings_{split}.npy'
 
-    if not os.path.exists(target_cache) or not os.path.exists(query_cache):
+    if not target_cache.exists() or not query_cache.exists():
         log.warning(f"Global embeddings for {split} not found! Computing them now...")
         from src.blocking import compute_embeddings
         t_texts = df_targets["name_addr"].fillna("").values
         q_texts = df_s1["name_addr"].fillna("").values
         
-        emb_targets = compute_embeddings(t_texts, save_path=Path(target_cache))
-        emb_s1 = compute_embeddings(q_texts, save_path=Path(query_cache))
+        emb_targets = compute_embeddings(t_texts, save_path=target_cache)
+        emb_s1 = compute_embeddings(q_texts, save_path=query_cache)
     else:
         emb_s1 = np.load(query_cache)
         emb_targets = np.load(target_cache)

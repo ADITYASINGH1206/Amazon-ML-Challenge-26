@@ -354,12 +354,13 @@ def dense_blocking_by_country(
         top_k = config.FAISS_TOP_K
 
     import torch
+    import os
 
-    target_cache = f'output/target_embeddings_{split}.npy'
-    query_cache = f'output/query_embeddings_{split}.npy'
+    target_cache = config.EMBEDDINGS_DIR / f'target_embeddings_{split}.npy'
+    query_cache = config.EMBEDDINGS_DIR / f'query_embeddings_{split}.npy'
 
-    if os.path.exists(target_cache) and os.path.exists(query_cache):
-        log.info("  Loading global embeddings from cache...")
+    if target_cache.exists() and query_cache.exists():
+        log.info(f"  Loading global embeddings from {config.EMBEDDINGS_DIR}...")
         global_emb_targets = np.load(target_cache)
         global_emb_queries = np.load(query_cache)
     else:
@@ -367,8 +368,8 @@ def dense_blocking_by_country(
         t_texts = df_targets["name_addr"].fillna("").values
         q_texts = df_queries["name_addr"].fillna("").values
 
-        global_emb_targets = compute_embeddings(t_texts, save_path=Path(target_cache))
-        global_emb_queries = compute_embeddings(q_texts, save_path=Path(query_cache))
+        global_emb_targets = compute_embeddings(t_texts, save_path=target_cache)
+        global_emb_queries = compute_embeddings(q_texts, save_path=query_cache)
 
     candidates = {}
     countries = df_queries["country_clean"].unique()
@@ -462,8 +463,8 @@ def run_blocking(split: str = "train",
 
     # ── Strategy 1: Inverted Index ──────────────────────────
     log.info("═══ Strategy 1: Inverted Index Blocking ═══")
-    inv_cands_path = f"output/inv_candidates_{split}.joblib"
-    if os.path.exists(inv_cands_path):
+    inv_cands_path = config.BLOCKING_DIR / f"inv_candidates_{split}.joblib"
+    if inv_cands_path.exists():
         log.info("  Loading inverted index candidates from cache...")
         cands_inv = joblib.load(inv_cands_path)
     else:
@@ -482,8 +483,8 @@ def run_blocking(split: str = "train",
 
     # ── Strategy 2: PyTorch Dense Blocking ────────────────────
     log.info("═══ Strategy 2: PyTorch Dense Blocking ═══")
-    dense_cands_path = f"output/dense_candidates_{split}.joblib"
-    if os.path.exists(dense_cands_path):
+    dense_cands_path = config.BLOCKING_DIR / f"dense_candidates_{split}.joblib"
+    if dense_cands_path.exists():
         log.info("  Loading dense candidates from cache...")
         cands_dense = joblib.load(dense_cands_path)
     else:
