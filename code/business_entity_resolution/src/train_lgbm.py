@@ -143,6 +143,20 @@ def train_lightgbm(X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, 
     for i in sorted_idx[:15]:
         log.info(f"    {FEATURE_NAMES[i]:35s}  {importance[i]:>8.0f}")
 
+    # ── Degenerate model detection ──────────────────────────────
+    if model.best_iteration_ <= 1:
+        log.warning("⚠️  MODEL DEGENERATE: only 1 boosting iteration completed.")
+        log.warning("    This usually means the dataset is too small for LightGBM to learn.")
+    if importance.sum() == 0:
+        log.warning("⚠️  MODEL DEGENERATE: all feature importances are zero.")
+        log.warning("    The model is predicting a constant (class prior) for all inputs.")
+    # Quick sanity check: are all train predictions identical?
+    _sample = X_train[:min(100, len(X_train))]
+    _preds = model.predict_proba(_sample)[:, 1]
+    if len(set(np.round(_preds, 6))) <= 1:
+        log.warning(f"⚠️  MODEL DEGENERATE: all predictions are constant ({_preds[0]:.6f}).")
+        log.warning("    Consider using more training data or relaxing early_stopping_rounds.")
+
     # Save model
     model_path = config.MODELS_DIR / "lgbm_model.pkl"
     with open(model_path, "wb") as f:
@@ -257,6 +271,16 @@ def run_lgbm_training():
         train_probs[b_start:b_end] = model.predict_proba(X_train[b_start:b_end])[:, 1]
     df_train_ids["lgbm_prob"] = train_probs
     del train_probs
+
+    # Pre-compute val probabilities (critical: val_features must include lgbm_prob
+    # for downstream threshold optimization and cross-encoder cascade filtering)
+    log.info("Computing val probabilities...")
+    val_probs = np.zeros(len(X_val), dtype=np.float32)
+    for b_start in range(0, len(X_val), b_size):
+        b_end = min(b_start + b_size, len(X_val))
+        val_probs[b_start:b_end] = model.predict_proba(X_val[b_start:b_end])[:, 1]
+    df_val_ids["lgbm_prob"] = val_probs
+    del val_probs
     
     # Save the lightweight ID-only dataframes (No features needed, drastically saves disk & RAM)
     df_val_ids.to_parquet(config.FEATURES_DIR / "val_features.parquet", index=False)

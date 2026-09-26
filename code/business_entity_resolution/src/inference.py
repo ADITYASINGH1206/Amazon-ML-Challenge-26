@@ -57,6 +57,19 @@ def lgbm_cascade_filter(
 
     if "lgbm_prob" not in df_features.columns:
         feature_cols = get_feature_columns()
+        # Defensive check: ensure feature columns actually exist
+        missing_cols = [c for c in feature_cols if c not in df_features.columns]
+        if missing_cols:
+            log.error(
+                f"Cannot score pairs: {len(missing_cols)} feature columns missing "
+                f"(e.g. {missing_cols[:3]}). DataFrame has columns: {list(df_features.columns)}. "
+                f"This usually means val_features.parquet was saved without feature columns "
+                f"or lgbm_prob. Re-run LightGBM training to regenerate."
+            )
+            raise KeyError(
+                f"Feature columns {missing_cols[:3]}... not found in DataFrame. "
+                f"Available columns: {list(df_features.columns)}"
+            )
         X = df_features[feature_cols].to_numpy(dtype=np.float32, copy=False)
         log.info(f"  Scoring {len(X):,} pairs with LightGBM in batches...")
         probs = np.zeros(len(X), dtype=np.float32)
@@ -219,7 +232,9 @@ def _global_dedup_with_margin(
     For each S2/S3 entity claimed by multiple S1 entities:
     - Assign to the S1 with the highest ensemble score
     - Only if margin over the second-highest S1 score > margin_delta
-    - Otherwise, don't assign to any S1 (too ambiguous)
+    - If scores are tied (margin == 0), use a deterministic tiebreaker
+      (lowest S1 entity ID) instead of rejecting the match entirely
+    - Otherwise (margin > 0 but < margin_delta), don't assign (ambiguous)
     """
     # Build reverse index directly from df_above (already above threshold!)
     reverse_index = defaultdict(list)
@@ -228,19 +243,28 @@ def _global_dedup_with_margin(
 
     # Resolve conflicts
     assignments = {}  # s2s3_id → s1_id (or None)
+    n_tiebroken = 0
     for s2s3_id, claimants in reverse_index.items():
         if len(claimants) == 1:
             assignments[s2s3_id] = claimants[0][0]  # Uncontested
         else:
-            # Sort by score descending
-            claimants.sort(key=lambda x: x[1], reverse=True)
+            # Sort by score descending, then by S1 entity ID ascending (tiebreaker)
+            claimants.sort(key=lambda x: (-x[1], x[0]))
             best_s1, best_score = claimants[0]
             second_score = claimants[1][1]
+            margin = best_score - second_score
 
-            if (best_score - second_score) >= margin_delta:
+            if margin >= margin_delta:
                 assignments[s2s3_id] = best_s1  # Clear winner
+            elif margin == 0.0:
+                # Exact tie: deterministic tiebreaker (lowest S1 ID wins).
+                # This prevents degenerate models (constant scores) from
+                # killing ALL matches. The sort above already places the
+                # lowest S1 ID first when scores are equal.
+                assignments[s2s3_id] = best_s1
+                n_tiebroken += 1
             else:
-                assignments[s2s3_id] = None  # Too ambiguous, skip
+                assignments[s2s3_id] = None  # Ambiguous (close but not tied)
 
     # Rebuild predictions from assignments
     predictions = {s1_id: set() for s1_id in raw_predictions}
@@ -251,7 +275,8 @@ def _global_dedup_with_margin(
     n_contested = sum(1 for v in reverse_index.values() if len(v) > 1)
     n_rejected = sum(1 for v in assignments.values() if v is None)
     log.info(f"  Global dedup: {n_contested:,} contested S2/S3 entities, "
-             f"{n_rejected:,} rejected (insufficient margin)")
+             f"{n_rejected:,} rejected (insufficient margin), "
+             f"{n_tiebroken:,} resolved by tiebreaker")
 
     return predictions
 
