@@ -93,5 +93,18 @@ def main():
         with open(curr_dec) as f:
             print(f"\nCurrent work/models/decision.json: {json.dumps(json.load(f), indent=2)}")
 
+    rep_path = os.path.join(work, "train_report.json")
+    if os.path.exists(rep_path):
+        with open(rep_path) as f:
+            rep = json.load(f)
+        print("\n" + "=" * 70)
+        print("TRAINING REPORT (OOF ON B):")
+        print("=" * 70)
+        print(f"Blocking recall on B: {rep.get('blocking_B', {})}")
+        print(f"Stage 1 models on B: {json.dumps(rep.get('stage1_B', {}), indent=2)}")
+        print(f"Stage 2 models on B: {json.dumps(rep.get('stage2_B', {}), indent=2)}")
+        print(f"Chosen rule: {rep.get('rule')} with params {rep.get('params')}")
+        print(f"Estimated F0.5: {rep.get('estimated_f05')}")
+
 if __name__ == "__main__":
     main()
