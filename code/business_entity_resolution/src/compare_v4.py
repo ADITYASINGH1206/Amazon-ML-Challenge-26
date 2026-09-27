@@ -9,12 +9,26 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+def find_work_dir():
+    candidates = [
+        os.path.join(ROOT, "work"),
+        os.path.join(ROOT, "..", "work"),
+        os.path.join(os.path.dirname(ROOT), "work"),
+        "D:\\cv\\Amazon-ML-Challenge-26\\work",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return os.path.abspath(c)
+    return os.path.abspath(os.path.join(ROOT, "..", "work"))
+
 def main():
-    work = os.path.join(ROOT, "work")
+    work = find_work_dir()
+    print(f"Detected work directory: {work}")
     v4_dir = os.path.join(work, "models_v4")
     v4_dec = os.path.join(v4_dir, "decision.json")
     v4_tsv = os.path.join(v4_dir, "matching_results.tsv")
-    curr_tsv = os.path.join(ROOT, "output", "matching_results.tsv")
+    out_dir = os.path.abspath(os.path.join(work, "..", "output"))
+    curr_tsv = os.path.join(out_dir, "matching_results.tsv")
 
     print("=" * 70)
     print("V4 MODEL & BACKUP AUDIT")
