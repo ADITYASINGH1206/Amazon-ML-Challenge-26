@@ -24,6 +24,12 @@ def find_work_dir():
 def main():
     work = find_work_dir()
     print(f"Detected work directory: {work}")
+    try:
+        print(f"Contents of {work}: {os.listdir(work)}")
+        parent = os.path.dirname(work)
+        print(f"Contents of {parent}: {os.listdir(parent)}")
+    except Exception as e:
+        print(f"Directory listing error: {e}")
     v4_dir = os.path.join(work, "models_v4")
     v4_dec = os.path.join(v4_dir, "decision.json")
     v4_tsv = os.path.join(v4_dir, "matching_results.tsv")
