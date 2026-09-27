@@ -82,6 +82,8 @@ Because intermediate artifacts are persisted to disk in `workdir/`, any stage ca
 | `python run_pipeline.py train_ce` | **Stage 3b**: DeBERTa-v3 Cross-Encoder with semantic boundary tagging (`[NAME]...[ADDR]...[CITY]`) | ~8 GB (8GB VRAM) | 25-30 min |
 | `python run_pipeline.py validate` | **Validation**: Joint grid search for optimal blending weight & threshold τ (up to 0.999) | ~4 GB | 1-2 min |
 | `python run_pipeline.py infer` | **Stage 4**: Test cascade pruning, cross-encoder re-ranking & Source-1-to-1 cardinality export | ~10 GB | 15-20 min |
+| `python run_pipeline.py validate_sub` | **Submission Check**: Runs official validator on output matching and candidate TSVs | < 1 GB | < 10 sec |
+| `python validate_submission.py` | **Standalone Validator**: Direct runner with auto-detected paths (supports `--check-ids`) | < 1 GB | < 10 sec |
 
 ---
 
