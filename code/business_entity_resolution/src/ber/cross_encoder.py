@@ -115,7 +115,7 @@ def train_cross_encoder(nname_s1, naddr_s1, nname_pool, naddr_pool,
     log(f"  using batch_train={batch_train} with AMP mixed precision")
 
     # Training loop
-    optimizer = torch.optim.AdamW(model.parameters(), lr=CE_LR, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CE_LR, eps=1e-6, weight_decay=0.01)
     n_steps = CE_EPOCHS * ((len(sel) + batch_train - 1) // batch_train)
     scheduler = get_linear_schedule_with_warmup(optimizer, int(n_steps * CE_WARMUP_RATIO), n_steps)
     loss_fn = torch.nn.BCEWithLogitsLoss()
@@ -141,7 +141,11 @@ def train_cross_encoder(nname_s1, naddr_s1, nname_pool, naddr_pool,
                            max_length=CE_MAXLEN, return_tensors="pt").to(device)
             with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 logits = model(**enc).logits.squeeze(-1)
-                loss = loss_fn(logits, batch_y)
+
+            # Compute loss in float32 for numerical stability (avoids DeBERTa-v3 NaN in lower precision)
+            loss = loss_fn(logits.float(), batch_y)
+            if not torch.isfinite(loss):
+                continue
 
             optimizer.zero_grad()
             if use_scaler:
