@@ -115,16 +115,12 @@ def train_cross_encoder(nname_s1, naddr_s1, nname_pool, naddr_pool,
     log(f"  using batch_train={batch_train} with AMP mixed precision")
 
     # Training loop
-    optimizer = torch.optim.AdamW(model.parameters(), lr=CE_LR, eps=1e-6, weight_decay=0.01)
+    batch_train = 64
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CE_LR, weight_decay=0.01)
     n_steps = CE_EPOCHS * ((len(sel) + batch_train - 1) // batch_train)
     scheduler = get_linear_schedule_with_warmup(optimizer, int(n_steps * CE_WARMUP_RATIO), n_steps)
     loss_fn = torch.nn.BCEWithLogitsLoss()
-    use_amp = torch.cuda.is_available()
-    use_bf16 = use_amp and torch.cuda.is_bf16_supported()
-    amp_dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_amp else torch.float32)
-    use_scaler = use_amp and not use_bf16
-    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
-    log(f"  using batch_train={batch_train} with AMP ({'bfloat16' if use_bf16 else 'float16'})")
+    log(f"  using batch_train={batch_train} in pure FP32 (DeBERTa-v3 numerical stability)")
 
     model.train()
     t0 = time.time()
@@ -139,25 +135,13 @@ def train_cross_encoder(nname_s1, naddr_s1, nname_pool, naddr_pool,
 
             enc = tokenizer(batch_a, batch_b, padding=True, truncation=True,
                            max_length=CE_MAXLEN, return_tensors="pt").to(device)
-            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                logits = model(**enc).logits.squeeze(-1)
-
-            # Compute loss in float32 for numerical stability (avoids DeBERTa-v3 NaN in lower precision)
-            loss = loss_fn(logits.float(), batch_y)
-            if not torch.isfinite(loss):
-                continue
+            logits = model(**enc).logits.squeeze(-1)
+            loss = loss_fn(logits, batch_y)
 
             optimizer.zero_grad()
-            if use_scaler:
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
             scheduler.step()
             losses.append(loss.item())
 
@@ -209,12 +193,8 @@ def score_pairs(nname_q, naddr_q, nname_pool, naddr_pool,
     scores = np.zeros(len(qi), dtype=np.float32)
 
     t0 = time.time()
-    use_amp = torch.cuda.is_available()
-    use_bf16 = use_amp and torch.cuda.is_bf16_supported()
-    amp_dtype = torch.bfloat16 if use_bf16 else (torch.float16 if use_amp else torch.float32)
-    with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
+    with torch.no_grad():
         for i in range(0, len(order), batch_size):
-
             batch_idx = order[i:i + batch_size]
             batch_a = [texts_a[j] for j in batch_idx]
             batch_b = [texts_b[j] for j in batch_idx]
@@ -222,7 +202,8 @@ def score_pairs(nname_q, naddr_q, nname_pool, naddr_pool,
             enc = tokenizer(batch_a, batch_b, padding=True, truncation=True,
                            max_length=CE_MAXLEN, return_tensors="pt").to(device)
             logits = model(**enc).logits.squeeze(-1)
-            scores[batch_idx] = torch.sigmoid(logits).cpu().numpy()
+            scores[batch_idx] = torch.sigmoid(logits.float()).cpu().numpy()
+
 
             if i % (batch_size * 50) == 0 and i > 0:
                 rate = i / (time.time() - t0)
