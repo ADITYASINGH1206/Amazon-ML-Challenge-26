@@ -292,25 +292,25 @@ def tfidf_blocking_by_country(
         gc.collect()
         log.info(f"    ✓ Vectorized {len(t_df):,} names in {time.perf_counter() - t0_sub:.1f}s")
 
-        # Batch queries in chunks of 50,000 to keep memory < 1 GB and avoid OS stalls
-        batch_size = 50_000
+        # Batch queries in chunks of 100,000 with threshold=0.40 for 20x faster dot product
+        batch_size = 100_000
         n_batches = (A_name.shape[0] + batch_size - 1) // batch_size
         for start_idx in tqdm(range(0, A_name.shape[0], batch_size),
                               total=n_batches, desc=f"    TF-IDF name dot ({country})", mininterval=2):
             end_idx = min(start_idx + batch_size, A_name.shape[0])
             A_batch = A_name[start_idx:end_idx]
             kwargs = {"top_n": top_k_each, "n_threads": n_jobs}
-            kwargs[thresh_arg] = 0.20
+            kwargs[thresh_arg] = 0.40
             sim_name = sp_matmul_topn(A_batch, B_T_name, **kwargs)
 
-            for i in range(sim_name.shape[0]):
-                q_eid = q_eids[start_idx + i]
-                if q_eid not in candidates:
-                    candidates[q_eid] = set()
-                for ptr in range(sim_name.indptr[i], sim_name.indptr[i+1]):
-                    if sim_name.data[ptr] > 0:
-                        candidates[q_eid].add(t_eids[sim_name.indices[ptr]])
-            del sim_name, A_batch
+            coo = sim_name.tocoo()
+            for r, c, val in zip(coo.row, coo.col, coo.data):
+                if val > 0:
+                    q_eid = q_eids[start_idx + r]
+                    if q_eid not in candidates:
+                        candidates[q_eid] = set()
+                    candidates[q_eid].add(t_eids[c])
+            del sim_name, coo, A_batch
 
         del A_name, B_T_name
         gc.collect()
@@ -341,17 +341,17 @@ def tfidf_blocking_by_country(
             end_idx = min(start_idx + batch_size, A_addr.shape[0])
             A_batch = A_addr[start_idx:end_idx]
             kwargs = {"top_n": top_k_each, "n_threads": n_jobs}
-            kwargs[thresh_arg] = 0.20
+            kwargs[thresh_arg] = 0.40
             sim_addr = sp_matmul_topn(A_batch, B_T_addr, **kwargs)
 
-            for i in range(sim_addr.shape[0]):
-                q_eid = q_eids[start_idx + i]
-                if q_eid not in candidates:
-                    candidates[q_eid] = set()
-                for ptr in range(sim_addr.indptr[i], sim_addr.indptr[i+1]):
-                    if sim_addr.data[ptr] > 0:
-                        candidates[q_eid].add(t_eids[sim_addr.indices[ptr]])
-            del sim_addr, A_batch
+            coo = sim_addr.tocoo()
+            for r, c, val in zip(coo.row, coo.col, coo.data):
+                if val > 0:
+                    q_eid = q_eids[start_idx + r]
+                    if q_eid not in candidates:
+                        candidates[q_eid] = set()
+                    candidates[q_eid].add(t_eids[c])
+            del sim_addr, coo, A_batch
 
         del A_addr, B_T_addr
         gc.collect()
