@@ -12,6 +12,7 @@ The union of all candidates becomes the final blocking set.
 """
 
 import os
+import time
 import joblib
 
 os.makedirs('output', exist_ok=True)
