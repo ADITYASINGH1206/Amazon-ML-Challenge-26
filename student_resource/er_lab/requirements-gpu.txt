@@ -1,0 +1,6 @@
+# keep your existing CUDA build of torch (e.g. 2.5.1+cu121); install the rest
+torch>=2.1
+transformers>=4.40
+sentence-transformers>=3.0
+datasets>=2.18
+accelerate>=0.30

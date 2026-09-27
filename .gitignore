@@ -1,32 +1,40 @@
-# Challenge-provided resources
+# --- challenge data and large binaries ---
+dataset/
+*.zip
 6ab10eb3b23ba_student_resource/
 __MACOSX/
-.DS_Store
 
-# Python
-venv/
-.venv/
-env/
-.env
-__pycache__/
-*.pyc
-
-# Datasets
-*.csv
+# --- data-derived and generated files (large; reproducible from code) ---
 *.tsv
 *.parquet
-*.pkl
 *.npy
-
-# Generated files
+*.pkl
+*.lgb
+work/
 workdir/
+er_work/
+er_work_gpu/
+toy_*/
 output/
+eda_report*.txt
+catboost_info/
 embeddings/
 models/
 preprocessed/
 blocking/
 features/
 
-# IDE
+# --- Python / tooling ---
+venv/
+.venv/
+env/
+.env
+__pycache__/
+*.pyc
+*.log
+*.bak
+
+# --- local editor / OS files ---
+.DS_Store
 .vscode/
 .idea/
