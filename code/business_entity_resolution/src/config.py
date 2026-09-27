@@ -72,10 +72,13 @@ CROSS_ENCODER_MAX_LEN = 256
 # ─────────────────────────────────────────────────────────────
 
 # Maximum candidates per S1 entity from blocking
-MAX_CANDIDATES_PER_ENTITY = 50
+MAX_CANDIDATES_PER_ENTITY = 60
 
 # FAISS: number of nearest neighbors to retrieve
-FAISS_TOP_K = 30
+FAISS_TOP_K = 35
+
+# TF-IDF sparse blocking top-k per entity (Name and Address separate)
+TFIDF_TOP_K = 25
 
 # FAISS IVF: number of Voronoi cells (rule of thumb: sqrt(n))
 FAISS_NLIST = 4096
@@ -84,7 +87,7 @@ FAISS_NLIST = 4096
 FAISS_NPROBE = 64
 
 # Inverted index: skip tokens appearing in more than this many docs
-TOKEN_MAX_DF = 50000
+TOKEN_MAX_DF = 75000
 
 # Minimum number of shared blocking tokens to consider a candidate
 MIN_SHARED_TOKENS = 1
@@ -117,7 +120,7 @@ LGBM_PARAMS = {
     "colsample_bytree": 0.8,
     "reg_alpha": 0.1,
     "reg_lambda": 1.0,
-    "scale_pos_weight": 1.0,   # will be overridden dynamically
+    "scale_pos_weight": 1.0,   # P1 fix: calibrated to 1.0 to preserve margin_delta
     "n_jobs": -1,
     "verbose": -1,
     "early_stopping_rounds": 150,
@@ -149,8 +152,8 @@ ENSEMBLE_WEIGHT_CE   = 0.65
 
 # Threshold search range for τ
 THRESHOLD_SEARCH_MIN  = 0.60
-THRESHOLD_SEARCH_MAX  = 0.98
-THRESHOLD_SEARCH_STEP = 0.005
+THRESHOLD_SEARCH_MAX  = 0.999   # Extended to allow precision peak near 0.990
+THRESHOLD_SEARCH_STEP = 0.002   # Fine resolution for F0.5 precision peak
 
 # Margin-based thresholding: minimum gap between best match score
 # and next-best *conflicting* candidate score to accept a match

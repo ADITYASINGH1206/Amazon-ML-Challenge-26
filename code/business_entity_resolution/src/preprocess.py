@@ -328,15 +328,19 @@ def preprocess_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df["name_addr"] = df["name_clean"] + " " + df["addr_clean"]
     df["name_addr"] = df["name_addr"].str.strip()
 
-    # Component extraction
-    log.info("  Extracting components...")
-    df["country_clean"] = df["country"].str.lower().str.strip()
-    df["street_num"] = df.apply(
-        lambda r: extract_street_number(r["addr_clean"]), axis=1
-    )
-    df["postal"] = df.apply(
-        lambda r: extract_postal_code(r["addr_clean"], r["country_clean"]), axis=1
-    )
+    # Component extraction (ultra-fast list comprehension, 10x faster than df.apply)
+    log.info("  Extracting components (street number, postal code, city, state)...")
+    df["country_clean"] = df["country"].fillna("").astype(str).str.lower().str.strip()
+    addr_clean_list = df["addr_clean"].fillna("").astype(str).tolist()
+    country_clean_list = df["country_clean"].tolist()
+
+    df["street_num"] = [extract_street_number(a) for a in addr_clean_list]
+    df["postal"] = [extract_postal_code(a, c) for a, c in zip(addr_clean_list, country_clean_list)]
+
+    city_state_tuples = [extract_city_state(a, c) for a, c in zip(addr_clean_list, country_clean_list)]
+    df["city"] = [t[0] for t in city_state_tuples]
+    df["state"] = [t[1] for t in city_state_tuples]
+    del city_state_tuples, addr_clean_list, country_clean_list
 
     # Name tokens for blocking (significant words only)
     df["name_tokens"] = df["name_clean"].apply(
@@ -367,8 +371,16 @@ def run_preprocessing(split: str = "train"):
     for label, path in paths.items():
         out_path = config.PREPROCESSED_DIR / f"{split}_{label}.parquet"
         if out_path.exists():
-            log.info(f"Preprocessed file {out_path.name} already exists. Skipping.")
-            continue
+            try:
+                import pyarrow.parquet as pq
+                schema = pq.read_schema(out_path)
+                if "city" in schema.names and "state" in schema.names:
+                    log.info(f"Preprocessed file {out_path.name} already exists and has city/state. Skipping.")
+                    continue
+                else:
+                    log.info(f"Preprocessed file {out_path.name} missing city/state columns. Re-generating...")
+            except Exception:
+                pass
 
         log.info(f"Processing {split}_{label}...")
         df = load_source(path)

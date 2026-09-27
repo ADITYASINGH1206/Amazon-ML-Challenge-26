@@ -141,20 +141,30 @@ def prepare_cross_encoder_data(
     del df_pos, df_hard, df_easy
     gc.collect()
 
-    log.info("Building fast text lookup for sampled pairs...")
-    s1_text = dict(zip(df_s1["entity_id"], df_s1["name_addr"].fillna("")))
-    target_text = dict(zip(df_targets["entity_id"], df_targets["name_addr"].fillna("")))
+    log.info("Building fast text lookup for sampled pairs with semantic boundary tagging...")
+    s1_name = dict(zip(df_s1["entity_id"], df_s1["name_clean"].fillna("")))
+    s1_addr = dict(zip(df_s1["entity_id"], df_s1["addr_clean"].fillna("")))
+    s1_city = dict(zip(df_s1["entity_id"], df_s1["city"].fillna(""))) if "city" in df_s1.columns else {}
+    target_name = dict(zip(df_targets["entity_id"], df_targets["name_clean"].fillna("")))
+    target_addr = dict(zip(df_targets["entity_id"], df_targets["addr_clean"].fillna("")))
+    target_city = dict(zip(df_targets["entity_id"], df_targets["city"].fillna(""))) if "city" in df_targets.columns else {}
 
     text_pairs = []
     labels = []
     for s1, s2, lbl in zip(df_selected["s1_id"], df_selected["s2s3_id"], df_selected["label"]):
-        t1 = s1_text.get(s1, "")
-        t2 = target_text.get(s2, "")
-        if t1 and t2:
+        n1 = s1_name.get(s1, "")
+        a1 = s1_addr.get(s1, "")
+        c1 = s1_city.get(s1, "")
+        n2 = target_name.get(s2, "")
+        a2 = target_addr.get(s2, "")
+        c2 = target_city.get(s2, "")
+        if n1 or a1:
+            t1 = f"[NAME] {n1} [ADDR] {a1} [CITY] {c1}".strip()
+            t2 = f"[NAME] {n2} [ADDR] {a2} [CITY] {c2}".strip()
             text_pairs.append((t1, t2))
             labels.append(int(lbl))
 
-    del df_selected, s1_text, target_text
+    del df_selected, s1_name, s1_addr, s1_city, target_name, target_addr, target_city
     gc.collect()
 
     log.info(f"  Total training pairs: {len(text_pairs):,} (pos: {sum(labels):,}, neg: {len(labels) - sum(labels):,})")
