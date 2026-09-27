@@ -519,6 +519,7 @@ def st_predict(a):
     log(f"test: {len(c):,} blocking pairs for {c.qi.nunique():,}/{len(s1):,} S1")
     cdir = os.path.join(a.work, "feats", "test_all")     # base features of ALL blocking pairs, cached per chunk
     os.makedirs(cdir, exist_ok=True)
+    from ber.feats import compute
     parts = []
     step = a.predict_chunk
     bounds = np.searchsorted(c.qi.values, np.arange(0, len(s1) + step, step))
@@ -529,7 +530,6 @@ def st_predict(a):
         if os.path.exists(path):
             cc = pd.read_parquet(path)
         else:
-            from ber.feats import compute
             cc = c.iloc[lo:hi].copy()
             for f, v in compute(S, P, cc.qi.values, cc.pj.values, idf, a.feat_workers).items():
                 cc[f] = v
