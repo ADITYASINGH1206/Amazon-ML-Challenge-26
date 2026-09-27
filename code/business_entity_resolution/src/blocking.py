@@ -272,10 +272,11 @@ def tfidf_blocking_by_country(
         t_eids = t_df["entity_id"].values
 
         # ── Vectorizer 1: Name only (prevents address dilution for short business names)
-        log.info("    Fitting TF-IDF on name_clean...")
+        log.info("    Fitting word TF-IDF on name_clean...")
+        t0_sub = time.perf_counter()
         vectorizer_name = TfidfVectorizer(
-            analyzer="char_wb",
-            ngram_range=(3, 3),
+            analyzer="word",
+            min_df=2,
             max_features=50_000,
             sublinear_tf=True,
             dtype=np.float32,
@@ -288,10 +289,13 @@ def tfidf_blocking_by_country(
         B_T_name = tfidf_t_name.transpose().tocsr()
         del tfidf_t_name, tfidf_q_name, vectorizer_name, t_names, q_names
         gc.collect()
+        log.info(f"    ✓ Vectorized {len(t_df):,} names in {time.perf_counter() - t0_sub:.1f}s")
 
         # Batch queries in chunks of 50,000 to keep memory < 1 GB and avoid OS stalls
         batch_size = 50_000
-        for start_idx in range(0, A_name.shape[0], batch_size):
+        n_batches = (A_name.shape[0] + batch_size - 1) // batch_size
+        for start_idx in tqdm(range(0, A_name.shape[0], batch_size),
+                              total=n_batches, desc=f"    TF-IDF name dot ({country})", mininterval=2):
             end_idx = min(start_idx + batch_size, A_name.shape[0])
             A_batch = A_name[start_idx:end_idx]
             kwargs = {"top_n": top_k_each, "n_threads": n_jobs}
@@ -311,10 +315,11 @@ def tfidf_blocking_by_country(
         gc.collect()
 
         # ── Vectorizer 2: Address only
-        log.info("    Fitting TF-IDF on addr_clean...")
+        log.info("    Fitting word TF-IDF on addr_clean...")
+        t0_sub = time.perf_counter()
         vectorizer_addr = TfidfVectorizer(
-            analyzer="char_wb",
-            ngram_range=(3, 3),
+            analyzer="word",
+            min_df=2,
             max_features=50_000,
             sublinear_tf=True,
             dtype=np.float32,
@@ -327,8 +332,11 @@ def tfidf_blocking_by_country(
         B_T_addr = tfidf_t_addr.transpose().tocsr()
         del tfidf_t_addr, tfidf_q_addr, vectorizer_addr, t_addrs, q_addrs
         gc.collect()
+        log.info(f"    ✓ Vectorized {len(t_df):,} addresses in {time.perf_counter() - t0_sub:.1f}s")
 
-        for start_idx in range(0, A_addr.shape[0], batch_size):
+        n_batches_addr = (A_addr.shape[0] + batch_size - 1) // batch_size
+        for start_idx in tqdm(range(0, A_addr.shape[0], batch_size),
+                              total=n_batches_addr, desc=f"    TF-IDF addr dot ({country})", mininterval=2):
             end_idx = min(start_idx + batch_size, A_addr.shape[0])
             A_batch = A_addr[start_idx:end_idx]
             kwargs = {"top_n": top_k_each, "n_threads": n_jobs}
