@@ -21,6 +21,37 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.utils import log, timed
+from src import config
+
+
+def _verify_data_paths():
+    """Sanity check: verify real dataset is found before running anything."""
+    critical_files = [
+        ("TRAIN_S1", config.TRAIN_S1, 100_000_000),   # >100MB expected
+        ("TRAIN_S2", config.TRAIN_S2, 100_000_000),
+        ("TRAIN_S3", config.TRAIN_S3, 100_000_000),
+        ("TRAIN_GT", config.TRAIN_GT, 10_000_000),     # >10MB expected
+        ("TEST_S1",  config.TEST_S1,  100_000_000),
+        ("TEST_S2",  config.TEST_S2,  100_000_000),
+        ("TEST_S3",  config.TEST_S3,  100_000_000),
+    ]
+    log.info(f"Data directory: {config.STUDENT_RESOURCE_DIR}")
+    all_ok = True
+    for name, path, min_size in critical_files:
+        if not path.exists():
+            log.error(f"  ❌ {name}: MISSING — {path}")
+            all_ok = False
+        elif path.stat().st_size < min_size:
+            size_mb = path.stat().st_size / 1e6
+            log.error(f"  ❌ {name}: TOO SMALL ({size_mb:.1f}MB) — likely mock data! {path}")
+            all_ok = False
+        else:
+            size_mb = path.stat().st_size / 1e6
+            log.info(f"  ✅ {name}: {size_mb:.0f}MB")
+    if not all_ok:
+        log.error("ABORTING: Data files missing or too small. Check STUDENT_RESOURCE_DIR.")
+        sys.exit(1)
+    log.info("All data files verified. ✅")
 
 
 @timed
@@ -259,6 +290,7 @@ def main():
         clean_all = len(sys.argv) > 2 and sys.argv[2].lower() in ("all", "--all", "-a")
         stage_clean(clean_all=clean_all)
     else:
+        _verify_data_paths()
         dispatch[stage]()
 
 

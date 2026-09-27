@@ -17,10 +17,19 @@ CODE_DIR = _THIS_DIR.parent                                       # code/busines
 PROJECT_ROOT = CODE_DIR.parent.parent                             # Amazon-ML-Challenge-26/
 
 # Override via environment variable if running on a different machine
-STUDENT_RESOURCE_DIR = Path(os.environ.get(
-    "STUDENT_RESOURCE_DIR",
-    PROJECT_ROOT / "6ab10eb3b23ba_student_resource" / "student_resource",
-))
+_DEFAULT_SR = PROJECT_ROOT / "6ab10eb3b23ba_student_resource" / "student_resource"
+_ALT_SR = PROJECT_ROOT / "student_resource"
+
+# Auto-detect: prefer the path that actually contains the dataset
+if os.environ.get("STUDENT_RESOURCE_DIR"):
+    STUDENT_RESOURCE_DIR = Path(os.environ["STUDENT_RESOURCE_DIR"])
+elif (_ALT_SR / "dataset").exists():
+    STUDENT_RESOURCE_DIR = _ALT_SR
+elif (_DEFAULT_SR / "dataset").exists():
+    STUDENT_RESOURCE_DIR = _DEFAULT_SR
+else:
+    # Fallback to the default path (will fail later with a clear error)
+    STUDENT_RESOURCE_DIR = _DEFAULT_SR
 
 TRAIN_DIR  = STUDENT_RESOURCE_DIR / "dataset" / "train"
 TEST_DIR   = STUDENT_RESOURCE_DIR / "dataset" / "test"
