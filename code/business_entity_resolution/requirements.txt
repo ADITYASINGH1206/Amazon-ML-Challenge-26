@@ -12,3 +12,5 @@ transformers==5.17.0
 sentence-transformers==6.1.0
 datasets==5.0.1
 accelerate==1.15.0
+scikit-learn>=1.4.0
+
