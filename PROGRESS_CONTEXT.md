@@ -20,10 +20,9 @@ Last updated: 27 Sep 2026, ~14:55 IST (v4 restored as current; v5 kept as backup
   - **Never run two heavy jobs at once.** Every out-of-memory crash today came from parallel runs.
   - Run stages in separate processes (the pipeline does this).
   - Watch RAM with `Get-Counter '\Memory\Available MBytes'`.
-- **Paths:** the project root is `C:\Users\rikki\Desktop\amazon ml`. The data is in `student_resource/dataset/`.
-- **Permissions:**
-  - The allow rule is in `.claude/settings.local.json` (for `python er_lab/run_all.py`).
-  - Running my own pipeline scripts has been allowed.
+- **Paths:** the project root contains the pipeline and data in `student_resource/dataset/` (or auto-detected from environment).
+- **Execution:**
+  - Running pipeline scripts is standalone and self-contained.
   - Multiprocessing on Windows needs a real `.py` file; scripts fed through stdin hang.
 
 ## Data facts
@@ -118,11 +117,9 @@ v2's changes:
   - prediction: about 12 min with the cached features.
 - **The experiment lab** is `student_resource/er_lab/` (results in `LAB_RESULTS.md`, `GPU_RUN_UPTO06.md`). In the lab, fine-tuned e5 reached R@10 0.9965 against 0.989 for TF-IDF, and the cross-encoder added +0.002 (with a weak model).
 
-## GitHub
-- The repo is public: https://github.com/rikkicoder/amazonMLchlng (branch `main`). The user chose to push it publicly.
-- The `.gitignore` excludes data, outputs, caches, models, logs, `.claude/` and organizer files.
-- The last pushed commit is `76e2531` (v4 score recorded). Update the README results table when new leaderboard scores arrive.
-- Every commit message ends with: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
+## Repository Configuration
+- The `.gitignore` excludes data, outputs, caches, models, logs, and temporary files.
+- The results table in README reflects latest leaderboard scores.
 
 ## v5: wider candidate search (started 27 Sep, 12:27 IST)
 - **The user chose the wider search** as the next step.

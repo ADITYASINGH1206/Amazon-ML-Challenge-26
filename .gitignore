@@ -27,5 +27,10 @@ __pycache__/
 *.bak
 
 # --- local editor / OS files ---
-.claude/
+.vscode/
+.idea/
 .DS_Store
+venv/
+catboost_info/
+models/
+
