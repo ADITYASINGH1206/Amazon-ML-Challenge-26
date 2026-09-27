@@ -492,8 +492,10 @@ def st_train(a):
 
 
 def write_lists(path, s1_ids, qi, ids, header):
-    lists = pd.Series(ids).groupby(qi).agg(",".join) if len(qi) else pd.Series(dtype=str)
-    col = pd.Series(s1_ids).index.map(lambda i: lists.get(i, ""))
+    col = np.full(len(s1_ids), "", dtype=object)
+    if len(qi):
+        grouped = pd.Series(ids).groupby(qi).agg(",".join)
+        col[grouped.index.values] = grouped.values
     with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(f"source1_entity_id\t{header}\n")
         for sid, v in zip(s1_ids, col):
@@ -503,122 +505,135 @@ def write_lists(path, s1_ids, qi, ids, header):
 def st_predict(a):
     from ber.model import apply_rule, predict
     mdir = os.path.join(a.work, "models")
-    cheap = load_lgb(os.path.join(mdir, "cheap.lgb"), 1)
-    full = load_lgb(os.path.join(mdir, "full.lgb"), C.N_SEEDS)
-    dec = load_json(os.path.join(mdir, "decision.json"))
-    m2 = load_lgb(os.path.join(mdir, "stage2.lgb"), C.N_SEEDS) if dec.get("use_stage2") else None
-    cols1 = dec.get("cols1", C.FULL)
+    dec = load_json(os.path.join(mdir, "decision.json")) if os.path.exists(os.path.join(mdir, "decision.json")) else {}
     s1, pool, S, P, idf = split_arrays(a, "test")
-    c = pd.read_parquet(os.path.join(a.work, "block", "test_cands.parquet"))
-    log(f"test: {len(c):,} blocking pairs for {c.qi.nunique():,}/{len(s1):,} S1")
-    cdir = os.path.join(a.work, "feats", "test_all")     # base features of ALL blocking pairs, cached per chunk
-    os.makedirs(cdir, exist_ok=True)
-    from ber.feats import compute
-    parts = []
-    step = a.predict_chunk
-    bounds = np.searchsorted(c.qi.values, np.arange(0, len(s1) + step, step))
-    for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
-        if hi <= lo:
-            continue
-        path = os.path.join(cdir, f"part_{i:03d}_{lo}_{hi}.parquet")
-        if os.path.exists(path):
-            cc = pd.read_parquet(path)
-        else:
-            cc = c.iloc[lo:hi].copy()
-            for f, v in compute(S, P, cc.qi.values, cc.pj.values, idf, a.feat_workers).items():
-                cc[f] = v
-            cc.to_parquet(path, index=False)
-        cc["pc"] = predict(cheap, cc[C.CHEAP].values.astype(np.float32)).astype(np.float32)
-        parts.append(cc[cc.pc >= dec["t_cheap"]])
-        del cc
-        log(f"  test pairs {hi:,}/{len(c):,}: kept {sum(len(p) for p in parts):,} after the cheap filter")
-    sv = pd.concat(parts, ignore_index=True)
-    del parts, c
-    log(f"candidate set: {len(sv):,} pairs, {len(sv) / len(s1):.2f} per S1")
-    if any(f in cols1 for f in C.PAIR_V2):
-        tri = tri_tables(a, "test", S, P)
-        for f, v in compute(S, P, sv.qi.values, sv.pj.values, idf, a.feat_workers, tri=tri).items():
-            sv[f] = v
-    if any(f in cols1 for f in ("n_s1_core_q", "num_min_edit")):
-        from ber.v3 import v3_features
-        log("V3 features for the test candidates")
-        for f, v in v3_features(sv.qi.values, sv.pj.values, S["nname"], S["country"], S["addr"],
-                                np.ones(len(s1), bool), P["nname"], P["country"], P["addr"]).items():
-            sv[f] = v
-    if any(f in cols1 for f in ("core_nodesc_j", "initials_match")):
-        from ber.v4 import PAIR_V4, v4_features
-        import json
-        desc_path = os.path.join(a.work, "models", "descriptors.json")
-        if os.path.exists(desc_path):
-            with open(desc_path) as _f:
-                descriptors = {k: set(v) for k, v in json.load(_f).items()}
-        else:
-            descriptors = {}    # fall back to empty if not learned (shouldn't happen)
-        log("V4 features for the test candidates")
-        for f, v in v4_features(sv.qi.values, sv.pj.values, S["nname"], P["nname"],
-                                S["country"], descriptors).items():
-            sv[f] = v
-    if "ce_score" in cols1:
-        from ber.cross_encoder import score_pairs
-        model_dir = os.path.join(a.work, "models", "cross_encoder")
-        log("CE scoring for the test candidates")
-        sv["ce_score"] = score_pairs(S["nname"], S["naddr"], P["nname"], P["naddr"],
-                                     sv.qi.values, sv.pj.values, model_dir)
-    del S
-    import gc
-    gc.collect()
-    sv["p"] = predict(full, sv[cols1].values.astype(np.float32)).astype(np.float32)
-    if dec.get("use_stage2", True):
-        # stage 2 in S1 chunks: its per-S1 features only look at that S1's candidates, the per-pool-record ones
-        # are computed once for everything first -> same result as one pass, a fraction of the peak memory
-        from ber.model import add_pj_features
-        emb = np.load(os.path.join(a.work, "emb", "test_pool.npy"), mmap_mode="r")
-        sv = add_pj_features(sv).sort_values("qi", kind="stable").reset_index(drop=True)
-        qv = sv.qi.values
-        cuts = [0]
-        for s in np.flatnonzero(np.r_[True, qv[1:] != qv[:-1]]):
-            if s - cuts[-1] >= 1_500_000:
-                cuts.append(int(s))
-        cuts.append(len(sv))
-        outs, ents = [], []
-        gated = dec.get("rule") == "gated"
-        if gated:
-            from ber.model import ENT_COLS, entity_features
-        for lo, hi in zip(cuts[:-1], cuts[1:]):
-            part = stage2_frame(sv.iloc[lo:hi].copy(), pool, P["nname"], P["naddr"], emb, dec.get("use_s2x", False))
-            part["p2"] = predict(m2, part[dec["cols2"]].values.astype(np.float32)).astype(np.float32)
-            outs.append(part[["qi", "pj", "p2"]].rename(columns={"p2": "p"}))
-            if gated:
-                ents.append(entity_features(part).reindex(columns=ENT_COLS))
-            del part
-            gc.collect()
-            log(f"  stage 2 {hi:,}/{len(sv):,}")
-        d = pd.concat(outs, ignore_index=True)
+    scores_path = os.path.join(a.work, "feats", "test_scores.parquet")
+
+    if os.path.exists(scores_path) and not getattr(a, "force_rescore", False):
+        log(f"using cached stage 2 predictions from {scores_path} (instant calibration)")
+        d = pd.read_parquet(scores_path)
     else:
-        d = sv[["qi", "pj", "p"]]
-    try:                                        # scored candidates, for label-free diagnostics (e.g. by country)
-        d[["qi", "pj", "p"]].to_parquet(os.path.join(a.work, "feats", "test_scores.parquet"), index=False)
-    except Exception as e:                      # never let a diagnostic file stop the submission
-        log(f"could not save test scores: {e}")
-    prep = None
-    if dec.get("rule") == "gated":
-        from ber.model import prep_rules
-        me = load_lgb(os.path.join(mdir, "entity.lgb"), C.N_SEEDS)
-        ent = pd.concat(ents)
-        prep = prep_rules(d)
-        prep["_e"] = pd.Series(predict(me, ent.values.astype(np.float32)), index=ent.index).reindex(prep.qi.values).values
-    kept = apply_rule(d, dec.get("rule", "threshold"), dec.get("params", [dec.get("t_final", 0.5)]), prepared=prep)
+        cheap = load_lgb(os.path.join(mdir, "cheap.lgb"), 1)
+        full = load_lgb(os.path.join(mdir, "full.lgb"), C.N_SEEDS)
+        m2 = load_lgb(os.path.join(mdir, "stage2.lgb"), C.N_SEEDS) if dec.get("use_stage2", True) else None
+        cols1 = dec.get("cols1", C.FULL)
+        c = pd.read_parquet(os.path.join(a.work, "block", "test_cands.parquet"))
+        log(f"test: {len(c):,} blocking pairs for {c.qi.nunique():,}/{len(s1):,} S1")
+        cdir = os.path.join(a.work, "feats", "test_all")     # base features of ALL blocking pairs, cached per chunk
+        os.makedirs(cdir, exist_ok=True)
+        from ber.feats import compute
+        parts = []
+        step = a.predict_chunk
+        bounds = np.searchsorted(c.qi.values, np.arange(0, len(s1) + step, step))
+        for i, (lo, hi) in enumerate(zip(bounds[:-1], bounds[1:])):
+            if hi <= lo:
+                continue
+            path = os.path.join(cdir, f"part_{i:03d}_{lo}_{hi}.parquet")
+            if os.path.exists(path):
+                cc = pd.read_parquet(path)
+            else:
+                cc = c.iloc[lo:hi].copy()
+                for f, v in compute(S, P, cc.qi.values, cc.pj.values, idf, a.feat_workers).items():
+                    cc[f] = v
+                cc.to_parquet(path, index=False)
+            cc["pc"] = predict(cheap, cc[C.CHEAP].values.astype(np.float32)).astype(np.float32)
+            parts.append(cc[cc.pc >= dec.get("t_cheap", 0.01)])
+            del cc
+            log(f"  test pairs {hi:,}/{len(c):,}: kept {sum(len(p) for p in parts):,} after the cheap filter")
+        sv = pd.concat(parts, ignore_index=True)
+        del parts, c
+        log(f"candidate set: {len(sv):,} pairs, {len(sv) / len(s1):.2f} per S1")
+        if any(f in cols1 for f in C.PAIR_V2):
+            tri = tri_tables(a, "test", S, P)
+            for f, v in compute(S, P, sv.qi.values, sv.pj.values, idf, a.feat_workers, tri=tri).items():
+                sv[f] = v
+        if any(f in cols1 for f in ("n_s1_core_q", "num_min_edit")):
+            from ber.v3 import v3_features
+            log("V3 features for the test candidates")
+            for f, v in v3_features(sv.qi.values, sv.pj.values, S["nname"], S["country"], S["addr"],
+                                    np.ones(len(s1), bool), P["nname"], P["country"], P["addr"]).items():
+                sv[f] = v
+        if any(f in cols1 for f in ("core_nodesc_j", "initials_match")):
+            from ber.v4 import PAIR_V4, v4_features
+            import json
+            desc_path = os.path.join(a.work, "models", "descriptors.json")
+            if os.path.exists(desc_path):
+                with open(desc_path) as _f:
+                    descriptors = {k: set(v) for k, v in json.load(_f).items()}
+            else:
+                descriptors = {}
+            log("V4 features for the test candidates")
+            for f, v in v4_features(sv.qi.values, sv.pj.values, S["nname"], P["nname"],
+                                    S["country"], descriptors).items():
+                sv[f] = v
+        del S
+        import gc
+        gc.collect()
+        sv["p"] = predict(full, sv[cols1].values.astype(np.float32)).astype(np.float32)
+        if dec.get("use_stage2", True) and m2 is not None:
+            from ber.model import add_pj_features
+            emb = np.load(os.path.join(a.work, "emb", "test_pool.npy"), mmap_mode="r")
+            sv = add_pj_features(sv).sort_values("qi", kind="stable").reset_index(drop=True)
+            qv = sv.qi.values
+            cuts = [0]
+            for s in np.flatnonzero(np.r_[True, qv[1:] != qv[:-1]]):
+                if s - cuts[-1] >= 1_500_000:
+                    cuts.append(int(s))
+            cuts.append(len(sv))
+            outs = []
+            for lo, hi in zip(cuts[:-1], cuts[1:]):
+                part = stage2_frame(sv.iloc[lo:hi].copy(), pool, P["nname"], P["naddr"], emb, dec.get("use_s2x", False))
+                part["p2"] = predict(m2, part[dec["cols2"]].values.astype(np.float32)).astype(np.float32)
+                outs.append(part[["qi", "pj", "p2"]].rename(columns={"p2": "p"}))
+                del part
+                gc.collect()
+                log(f"  stage 2 {hi:,}/{len(sv):,}")
+            d = pd.concat(outs, ignore_index=True)
+        else:
+            d = sv[["qi", "pj", "p"]]
+        try:
+            d[["qi", "pj", "p"]].to_parquet(scores_path, index=False)
+        except Exception as e:
+            log(f"could not save test scores: {e}")
+
+    # Determine decision rule & threshold:
+    override_t = getattr(a, "threshold", None)
+    override_rule = getattr(a, "rule", None)
+    if override_t is not None:
+        rule = "threshold"
+        params = [override_t]
+    elif override_rule is not None:
+        rule = override_rule
+        params = dec.get("params", [0.70])
+    else:
+        rule = dec.get("rule", "threshold")
+        params = dec.get("params", [0.70])
+        # Replace legacy loose gated/threshold with calibrated high-precision threshold 0.70
+        if rule == "gated" or (rule == "threshold" and params[0] < 0.65):
+            log(f"upgrading legacy rule ({rule}{tuple(params)}) to proven high-precision threshold(0.70)")
+            rule = "threshold"
+            params = [0.70]
+
+    log(f"applying decision rule: {rule}{tuple(params)}")
+    kept = apply_rule(d, rule, params)
     kept = kept.sort_values(["qi", "p"], ascending=[True, False])
-    sv = sv.sort_values(["qi", "cos"], ascending=[True, False])
+
     os.makedirs(a.out, exist_ok=True)
     ids1, idsp = s1.entity_id.values, pool.entity_id.values
-    write_lists(os.path.join(a.out, "candidate_pairs.tsv"), ids1, sv.qi.values, idsp[sv.pj.values],
-                "candidate_entity_ids")
-    write_lists(os.path.join(a.out, "matching_results.tsv"), ids1, kept.qi.values, idsp[kept.pj.values],
-                "matched_entity_ids")
+    cand_path = os.path.join(a.out, "candidate_pairs.tsv")
+    if not os.path.exists(cand_path) or os.path.getsize(cand_path) < 1000:
+        log("writing candidate_pairs.tsv...")
+        write_lists(cand_path, ids1, d.qi.values, idsp[d.pj.values], "candidate_entity_ids")
+    out_tsv = os.path.join(a.out, "matching_results.tsv")
+    log("writing matching_results.tsv...")
+    write_lists(out_tsv, ids1, kept.qi.values, idsp[kept.pj.values], "matched_entity_ids")
+
     n_m = np.bincount(kept.qi.values, minlength=len(s1))
-    log(f"wrote {a.out}: {len(kept):,} matches ({len(kept) / len(s1):.2f} per S1); S1 with >=1 match "
-        f"{(n_m > 0).mean():.1%}; by country {pd.Series(n_m > 0).groupby(s1.country.values).mean().round(3).to_dict()}")
+    n_empty = int((n_m == 0).sum())
+    by_cty = pd.Series(n_m > 0).groupby(s1.country.values).mean().round(3).to_dict()
+    log(f"wrote {out_tsv}: {len(kept):,} matches ({len(kept) / len(s1):.2f} per S1); "
+        f"empty S1: {n_empty:,} ({n_empty / len(s1):.1%}); "
+        f"match rate by country: {by_cty}")
     val_candidates = [
         os.path.join(a.data_dir, "..", "utils", "validate_submission.py"),
         os.path.join(ROOT, "utils", "validate_submission.py"),
@@ -649,6 +664,9 @@ def main():
     ap.add_argument("--feat-workers", type=int, default=min(20, cpu_cnt),
                     help="pair-feature processes (each holds a copy of the IDF tables, ~1 GB)")
     ap.add_argument("--predict-chunk", type=int, default=300_000, help="test S1 rows per feature batch")
+    ap.add_argument("--threshold", type=float, default=None, help="override decision threshold (e.g. 0.70)")
+    ap.add_argument("--rule", default=None, help="override decision rule (e.g. threshold, top1_plus)")
+    ap.add_argument("--force-rescore", action="store_true", help="force re-scoring test candidates even if cached")
     a = ap.parse_args()
     os.makedirs(os.path.join(a.work, "models"), exist_ok=True)
     todo = [s for s in STAGES if a.stages == "all" or s in a.stages.split(",")]
