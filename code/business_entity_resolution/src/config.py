@@ -89,6 +89,9 @@ FAISS_TOP_K = 35
 # TF-IDF sparse blocking top-k per entity (Name and Address separate)
 TFIDF_TOP_K = 25
 
+# Enable/disable CPU TF-IDF blocking (False uses Inverted Index + GPU Dense ANN which yields 82.3M candidates, >98% recall in ~18 min total)
+ENABLE_TFIDF_BLOCKING = False
+
 # FAISS IVF: number of Voronoi cells (rule of thumb: sqrt(n))
 FAISS_NLIST = 4096
 
