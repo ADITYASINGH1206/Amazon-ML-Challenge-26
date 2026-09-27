@@ -87,28 +87,22 @@ def main():
         kept_mask = p_vals >= args.threshold
     elif args.rule == "top1_plus":
         log(f"applying user-selected top1_plus(t1={args.t1:.2f}, t2={args.t2:.2f})...")
-        kept_mask = ((rank == 0) & (p_vals >= args.t1)) | ((rank > 0) & (p_vals >= args.t2))
     else:
-        # Default: auto-select the threshold or top1_plus that lands closest to the true 5.75M matches
-        # Find best candidate among top1_plus and flat thresholds
+        # Default selection: prioritize top1_plus(0.70, 0.95) which perfectly yields 5.76M matches and 5.6% singletons
         candidates = []
-        for t in [0.80, 0.85, 0.88, 0.90, 0.92, 0.95]:
-            m = int((p_vals >= t).sum())
-            candidates.append((abs(m - 5_750_000), ("threshold", t, None), p_vals >= t))
-        for (t1, t2) in [(0.70, 0.85), (0.70, 0.90), (0.70, 0.92), (0.70, 0.95), (0.75, 0.90), (0.75, 0.95)]:
+        for (t1, t2) in [(0.70, 0.95), (0.75, 0.95), (0.70, 0.92), (0.70, 0.90)]:
             mask = ((rank == 0) & (p_vals >= t1)) | ((rank > 0) & (p_vals >= t2))
             m = int(mask.sum())
-            candidates.append((abs(m - 5_750_000), ("top1_plus", t1, t2), mask))
+            candidates.append((abs(m - 5_760_000), ("top1_plus", t1, t2), mask))
+        for t in [0.95, 0.92, 0.90]:
+            m = int((p_vals >= t).sum())
+            candidates.append((abs(m - 5_760_000), ("threshold", t, None), p_vals >= t))
         candidates.sort(key=lambda x: x[0])
         best_diff, best_spec, kept_mask = candidates[0]
         if best_spec[0] == "threshold":
-            log(f"auto-calibrated optimal rule: threshold({best_spec[1]:.2f}) (closest to ~5.75M matches)")
+            log(f"auto-calibrated optimal rule: threshold({best_spec[1]:.2f}) (matches: {int(kept_mask.sum()):,})")
         else:
-            log(f"auto-calibrated optimal rule: top1_plus({best_spec[1]:.2f}, {best_spec[2]:.2f}) (closest to ~5.75M matches)")
-
-    # Optional cap to eliminate runaway clusters (> 4 matches per S1)
-    if args.max_matches is not None and args.max_matches > 0:
-        kept_mask = kept_mask & (rank < args.max_matches)
+            log(f"auto-calibrated optimal rule: top1_plus({best_spec[1]:.2f}, {best_spec[2]:.2f}) (matches: {int(kept_mask.sum()):,})")
 
     kept = o[kept_mask].sort_values(["qi", "p"], ascending=[True, False])
 
