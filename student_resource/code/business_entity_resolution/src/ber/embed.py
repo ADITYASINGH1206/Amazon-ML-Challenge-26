@@ -5,8 +5,9 @@ import os
 import numpy as np
 import pandas as pd
 
-from .config import (EMB_BASE, EMB_MAXLEN, EMB_PREFIX, FT_BATCH, FT_LR, FT_PAIRS, FT_RANGE, SEED)
+from .config import (EMB_BASE, EMB_MAXLEN, EMB_PREFIX, FT_BATCH, FT_EPOCHS, FT_LR, FT_PAIRS, FT_RANGE, SEED)
 from .util import log
+
 
 
 def joint_texts(names, addrs):
