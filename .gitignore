@@ -1,0 +1,31 @@
+# --- challenge data and organiser material (not ours to publish) ---
+dataset/
+*.zip
+*.pdf
+student_resource/README.md
+student_resource/Documentation_template.md
+student_resource/utils/
+6ab10eb3b23ba_student_resource/
+
+# --- data-derived and generated files (large; reproducible from code) ---
+*.tsv
+*.parquet
+*.npy
+*.pkl
+*.lgb
+work/
+er_work/
+er_work_gpu/
+toy_*/
+output/
+eda_report*.txt
+
+# --- Python / tooling ---
+__pycache__/
+*.pyc
+*.log
+*.bak
+
+# --- local editor / OS files ---
+.claude/
+.DS_Store
