@@ -134,10 +134,22 @@ def stage_validate():
 
 
 @timed
+def stage_validate_submission():
+    """Validate output submission files (matching_results.tsv & candidate_pairs.tsv)."""
+    from validate_submission import run_validation
+    return run_validation()
+
+
+@timed
 def stage_infer():
     """Stages 3+4: Full inference on test data."""
     from src.inference import run_inference
     run_inference("test")
+    if (config.OUTPUT_DIR / "matching_results.tsv").exists():
+        log.info("\n" + "="*60)
+        log.info("VALIDATING SUBMISSION FORMAT")
+        log.info("="*60)
+        stage_validate_submission()
 
 
 @timed
@@ -264,6 +276,7 @@ def main():
         print("  train_ce      Stage 3b: Cross-encoder fine-tuning")
         print("  validate      Threshold optimization on validation")
         print("  infer         Full inference on test data")
+        print("  validate_sub  Run official submission format validator")
         print("  clean         Remove previous blocking/feature/model cache")
         sys.exit(0)
 
@@ -278,6 +291,8 @@ def main():
         "train_ce": stage_train_cross_encoder,
         "validate": stage_validate,
         "infer": stage_infer,
+        "validate_sub": stage_validate_submission,
+        "validate_submission": stage_validate_submission,
         "clean": stage_clean,
     }
 
