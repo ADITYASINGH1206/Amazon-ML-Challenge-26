@@ -333,8 +333,8 @@ def st_train(a):
     dec_path = os.path.join(mdir, "decision.json")
     if exists(*(os.path.join(mdir, f) for f in ("cheap.lgb", "full.lgb", "stage2.lgb", "decision.json"))):
         dec_existing = load_json(dec_path)
-        if dec_existing.get("rule") == "gated":
-            log("detected legacy 'gated' decision rule -- automatically re-tuning to top1_plus with empty-address rescue")
+        if dec_existing.get("rule") in ("gated", "relative"):
+            log(f"detected legacy '{dec_existing.get('rule')}' rule -- automatically re-tuning to top1_plus / threshold")
             try:
                 os.remove(dec_path)
                 s2_path = os.path.join(mdir, "stage2.lgb")
@@ -457,12 +457,6 @@ def st_train(a):
         m = fit_lgb(X[~te], y[~te], q[~te], C.LGB_STAGE2, a.n_jobs)
         p2[te] = predict(m, X[te])
     d2 = d[["qi", "pj"]].assign(p=p2)
-    # Empty-address high-precision rescue (98.7% empirical precision):
-    if "core_c_eq_unique_s1" in sv and "addr_empty_c" in sv:
-        rescue_b = (sv.addr_empty_c.values == 1) & (sv.core_c_eq_unique_s1.values == 1)
-        if rescue_b.any():
-            d2.loc[rescue_b, "p"] = np.maximum(d2.loc[rescue_b, "p"].values, 0.75)
-            log(f"  rescued {rescue_b.sum():,} unique-name empty-address true candidates in B (98.7% empirical precision)")
     # S1-level "has at least one match" model (5-fold OOF on B) for the singleton-protecting 'gated' rule
     from ber.model import ENT_COLS, entity_features, prep_rules
     ent = entity_features(d.assign(p2=p2)).reindex(index=np.where(inB)[0], columns=ENT_COLS)
@@ -602,12 +596,6 @@ def st_predict(a):
         d = pd.concat(outs, ignore_index=True)
     else:
         d = sv[["qi", "pj", "p"]]
-    # 98.7% empirical precision empty-address unique core-name rescue in test:
-    if "core_c_eq_unique_s1" in sv and "addr_empty_c" in sv:
-        rescue_test = (sv.addr_empty_c.values == 1) & (sv.core_c_eq_unique_s1.values == 1)
-        if rescue_test.any():
-            d.loc[rescue_test, "p"] = np.maximum(d.loc[rescue_test, "p"].values, 0.75)
-            log(f"  rescued {rescue_test.sum():,} unique-name empty-address true candidates in test (98.7% empirical precision)")
     try:                                        # scored candidates, for label-free diagnostics (e.g. by country)
         d[["qi", "pj", "p"]].to_parquet(os.path.join(a.work, "feats", "test_scores.parquet"), index=False)
     except Exception as e:                      # never let a diagnostic file stop the submission

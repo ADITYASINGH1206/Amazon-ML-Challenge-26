@@ -297,11 +297,9 @@ ENT_COLS = ["e_pmax", "e_psum", "e_ncand", "e_nhi", "e_nmid", "e_p2nd", "e_cosma
 RULES = {
     "gated": (rule_gated, [(tE, t1, t2) for tE in (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
                            for t1 in (0.2, 0.3, 0.4, 0.5, 0.6) for t2 in (0.6, 0.65, 0.7, 0.75, 0.8, 0.85)]),
-    "threshold": (rule_threshold, [(t,) for t in np.round(np.arange(0.3, 0.96, 0.025), 3)]),
-    "top1_plus": (rule_top1_plus, [(t1, t2) for t1 in np.round(np.arange(0.25, 0.75, 0.05), 2)
-                                   for t2 in np.round(np.arange(0.55, 0.95, 0.05), 2) if t2 >= t1]),
-    "relative": (rule_relative, [(t, r) for t in np.round(np.arange(0.3, 0.9, 0.05), 2) for r in (0.5, 0.7, 0.8)]),
-    "expected_f": (rule_expected_f, [(c,) for c in (0.0, 0.05, 0.1, 0.2)]),
+    "threshold": (rule_threshold, [(t,) for t in np.round(np.arange(0.60, 0.85, 0.025), 3)]),
+    "top1_plus": (rule_top1_plus, [(t1, t2) for t1 in (0.45, 0.50, 0.55, 0.60, 0.65)
+                                   for t2 in (0.70, 0.75, 0.80, 0.85) if t2 >= t1]),
 }
 
 

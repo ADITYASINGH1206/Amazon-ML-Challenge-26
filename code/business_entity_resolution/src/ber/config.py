@@ -61,7 +61,7 @@ USE_S2X = True                      # embedding-cluster + relative features in s
 USE_CROSSFIT = True                 # cross-fit A<->B for more stage-1 training data (OPT-3)
 N_SEEDS = 3                         # OPT-9: seed ensembling (number of models to train and average)
 LGB_FULL = LGB_PARAMS               # full-matcher parameters
-RULES_TRY = ("threshold", "top1_plus", "relative", "expected_f")   # decision rules compared on B folds 0-2
+RULES_TRY = ("top1_plus", "threshold")   # high-precision decision rules (prevents loose thresholds <0.5)
 
 CHEAP_THRESHOLDS = (0.0005, 0.001, 0.002, 0.003, 0.005, 0.01, 0.02)
 CHEAP_MAX_RECALL_LOSS = 0.003       # largest cheap threshold losing at most this much pair recall on B (0.02 is the knee: -18% candidates for -0.0002 F0.5)
