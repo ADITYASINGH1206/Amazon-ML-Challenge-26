@@ -1,7 +1,7 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** Aditya KS MITS  
-**Team Members:** Aditya  
+**Team Name:** Omnivision    
+**Team Members:** Aditya Kumar Singh, Aditya Raj Gupta and Sharad Polackal Sunil
 **Submission Date:** September 2026
 
 ---
