@@ -1,7 +1,8 @@
 # ML Challenge 2026: Business Entity Resolution Solution Template
 
-**Team Name:** EntityResolutionAI  
-**Submission Date:** September 2026  
+**Team Name:** Aditya KS MITS  
+**Team Members:** Aditya  
+**Submission Date:** September 2026
 
 ---
 
