@@ -116,17 +116,20 @@ def main():
         print(f"  Total empty S1: {n_empty:,} ({n_empty / len(s1):.2%})")
         print(f"  Match rate by country: {by_cty}")
 
+        data_dir = find_data_dir(ROOT)
+        test_dir = os.path.join(data_dir, "test") if data_dir else None
         val_candidates = [
+            os.path.join(data_dir, "..", "utils", "validate_submission.py") if data_dir else "",
             os.path.join(ROOT, "utils", "validate_submission.py"),
             os.path.join(ROOT, "..", "utils", "validate_submission.py"),
             os.path.join(work, "..", "6ab10eb3b23ba_student_resource", "student_resource", "utils", "validate_submission.py"),
         ]
-        val = next((cand for cand in val_candidates if os.path.exists(cand)), None)
-        if val:
+        val = next((cand for cand in val_candidates if cand and os.path.exists(cand)), None)
+        if val and test_dir and os.path.exists(test_dir):
             import subprocess
             r = subprocess.run([sys.executable, val, "--matching", out_tsv,
                                 "--candidate", os.path.join(out_dir, "candidate_pairs.tsv"),
-                                "--test-dir", os.path.join(os.path.dirname(work), "6ab10eb3b23ba_student_resource", "student_resource", "dataset", "test")])
+                                "--test-dir", test_dir])
             print(f"Validator exit code: {r.returncode}")
 
 
