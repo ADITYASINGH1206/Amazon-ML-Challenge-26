@@ -13,4 +13,7 @@ sentence-transformers==6.1.0
 datasets==5.0.1
 accelerate==1.15.0
 scikit-learn>=1.4.0
+sentencepiece>=0.2.0
+tiktoken>=0.7.0
+
 
