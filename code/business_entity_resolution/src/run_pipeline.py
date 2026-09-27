@@ -182,6 +182,7 @@ def st_feats(a):
 
 def st_feats3(a):
     """Add the V3 features (name uniqueness, fuzzy house numbers) to the training features."""
+    import gc
     from ber.v3 import PAIR_V3, v3_features
     out = os.path.join(a.work, "feats", "train.parquet")
     c = pd.read_parquet(out)
@@ -190,6 +191,8 @@ def st_feats3(a):
     s1, pool, S, P, _ = split_arrays(a, "train")
     lo, hi = C.TRAIN_HIDDEN_S1
     present = ~((s1.prio.values >= lo) & (s1.prio.values < hi))
+    del s1, pool
+    gc.collect()
     log(f"V3 features for {len(c):,} training pairs")
     for f, v in v3_features(c.qi.values, c.pj.values, S["nname"], S["country"], S["addr"], present,
                             P["nname"], P["country"], P["addr"]).items():
@@ -200,12 +203,17 @@ def st_feats3(a):
 
 def st_feats4(a):
     """Add V4 features (descriptor-word vocabulary + initials matching) to training features."""
+    import gc
     from ber.v4 import PAIR_V4, learn_descriptors, v4_features
     out = os.path.join(a.work, "feats", "train.parquet")
     c = pd.read_parquet(out)
     if all(f in c for f in PAIR_V4):
         return
     s1, pool, S, P, _ = split_arrays(a, "train")
+    s1_addr = s1.addr.values
+    pool_addr = pool.addr.values
+    del s1, pool
+    gc.collect()
     desc_path = os.path.join(a.work, "models", "descriptors.json")
     if os.path.exists(desc_path):
         import json
@@ -219,7 +227,7 @@ def st_feats4(a):
         descriptors = learn_descriptors(
             S["nname"], P["nname"], c.qi.values, c.pj.values,
             c.label.values.astype(np.int8), prob.astype(np.float32),
-            S["country"], s1.addr.values, P["country"], pool.addr.values)
+            S["country"], s1_addr, P["country"], pool_addr)
         # Save for reuse in predict
         import json
         with open(desc_path, "w") as f:
