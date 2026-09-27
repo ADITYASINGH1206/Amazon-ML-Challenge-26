@@ -248,7 +248,7 @@ def st_ce_train(a):
     out = os.path.join(a.work, "models", "cross_encoder")
     if os.path.exists(os.path.join(out, "config.json")):
         return
-    c = pd.read_parquet(os.path.join(a.work, "feats", "train.parquet"))
+    c = pd.read_parquet(os.path.join(a.work, "feats", "train.parquet"), columns=["qi", "pj", "label"])
     s1, pool, S, P, _ = split_arrays(a, "train")
     
     # Train on A slice (+ U slice if cross-fitting)
@@ -257,10 +257,16 @@ def st_ce_train(a):
     prio = s1.prio.values[c.qi.values]
     mask = ((prio >= lo) & (prio < hi)) | ((prio >= ulo) & (prio < uhi))
     c_train = c[mask]
+    qi = c_train.qi.values
+    pj = c_train.pj.values
+    labs = c_train.label.values.astype(np.int8)
+    del c, c_train, s1, pool, prio, mask
+    import gc
+    gc.collect()
     
     from ber.cross_encoder import train_cross_encoder
     train_cross_encoder(S["nname"], S["naddr"], P["nname"], P["naddr"],
-                        c_train.qi.values, c_train.pj.values, c_train.label.values.astype(np.int8), out)
+                        qi, pj, labs, out)
 
 
 def st_ce_score(a):
