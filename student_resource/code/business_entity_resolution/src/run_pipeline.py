@@ -330,9 +330,21 @@ def st_train(a):
                            tune_rule)
     from ber.prep import load_norm
     mdir = os.path.join(a.work, "models")
+    dec_path = os.path.join(mdir, "decision.json")
     if exists(*(os.path.join(mdir, f) for f in ("cheap.lgb", "full.lgb", "stage2.lgb", "decision.json"))):
-        log("models found -- skipping train")
-        return
+        dec_existing = load_json(dec_path)
+        if dec_existing.get("rule") == "gated":
+            log("detected legacy 'gated' decision rule -- automatically re-tuning to top1_plus with empty-address rescue")
+            try:
+                os.remove(dec_path)
+                s2_path = os.path.join(mdir, "stage2.lgb")
+                if os.path.exists(s2_path):
+                    os.remove(s2_path)
+            except Exception:
+                pass
+        else:
+            log("models found -- skipping train")
+            return
     s1, pool = load_split(a.work, "train")
     _, npl, _ = load_norm(a.work, "train")
     emb = np.load(os.path.join(a.work, "emb", "train_pool.npy"), mmap_mode="r")
