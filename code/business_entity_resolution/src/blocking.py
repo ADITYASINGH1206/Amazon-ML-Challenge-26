@@ -244,11 +244,15 @@ def tfidf_blocking_by_country(
     """
     from sparse_dot_topn import sp_matmul_topn
     import multiprocessing
+    import inspect
+
+    sig = inspect.signature(sp_matmul_topn)
+    thresh_arg = "threshold" if "threshold" in sig.parameters else "lower_bound"
 
     candidates = {}
     countries = df_queries["country_clean"].unique()
-    top_k_each = max(1, top_k // 2)
-    n_jobs = multiprocessing.cpu_count() or 4
+    top_k_each = max(1, (top_k or config.TFIDF_TOP_K) // 2)
+    n_jobs = min(multiprocessing.cpu_count() or 4, 16)
 
     for country in countries:
         log.info(f"  TF-IDF blocking for country: {country}")
@@ -270,9 +274,9 @@ def tfidf_blocking_by_country(
         # ── Vectorizer 1: Name only (prevents address dilution for short business names)
         log.info("    Fitting TF-IDF on name_clean...")
         vectorizer_name = TfidfVectorizer(
-            analyzer=config.TFIDF_ANALYZER,
-            ngram_range=config.TFIDF_NGRAM_RANGE,
-            max_features=config.TFIDF_MAX_FEATURES,
+            analyzer="char_wb",
+            ngram_range=(3, 3),
+            max_features=50_000,
             sublinear_tf=True,
             dtype=np.float32,
         )
@@ -282,25 +286,36 @@ def tfidf_blocking_by_country(
         tfidf_q_name = vectorizer_name.transform(q_names)
         A_name = tfidf_q_name.tocsr()
         B_T_name = tfidf_t_name.transpose().tocsr()
-        sim_name = sp_matmul_topn(A_name, B_T_name, top_n=top_k_each, n_threads=n_jobs)
+        del tfidf_t_name, tfidf_q_name, vectorizer_name, t_names, q_names
+        gc.collect()
 
-        for i in range(sim_name.shape[0]):
-            q_eid = q_eids[i]
-            if q_eid not in candidates:
-                candidates[q_eid] = set()
-            for ptr in range(sim_name.indptr[i], sim_name.indptr[i+1]):
-                if sim_name.data[ptr] > 0:
-                    candidates[q_eid].add(t_eids[sim_name.indices[ptr]])
+        # Batch queries in chunks of 50,000 to keep memory < 1 GB and avoid OS stalls
+        batch_size = 50_000
+        for start_idx in range(0, A_name.shape[0], batch_size):
+            end_idx = min(start_idx + batch_size, A_name.shape[0])
+            A_batch = A_name[start_idx:end_idx]
+            kwargs = {"top_n": top_k_each, "n_threads": n_jobs}
+            kwargs[thresh_arg] = 0.20
+            sim_name = sp_matmul_topn(A_batch, B_T_name, **kwargs)
 
-        del tfidf_t_name, tfidf_q_name, sim_name, vectorizer_name, A_name, B_T_name
+            for i in range(sim_name.shape[0]):
+                q_eid = q_eids[start_idx + i]
+                if q_eid not in candidates:
+                    candidates[q_eid] = set()
+                for ptr in range(sim_name.indptr[i], sim_name.indptr[i+1]):
+                    if sim_name.data[ptr] > 0:
+                        candidates[q_eid].add(t_eids[sim_name.indices[ptr]])
+            del sim_name, A_batch
+
+        del A_name, B_T_name
         gc.collect()
 
         # ── Vectorizer 2: Address only
         log.info("    Fitting TF-IDF on addr_clean...")
         vectorizer_addr = TfidfVectorizer(
-            analyzer=config.TFIDF_ANALYZER,
-            ngram_range=config.TFIDF_NGRAM_RANGE,
-            max_features=config.TFIDF_MAX_FEATURES,
+            analyzer="char_wb",
+            ngram_range=(3, 3),
+            max_features=50_000,
             sublinear_tf=True,
             dtype=np.float32,
         )
@@ -310,17 +325,26 @@ def tfidf_blocking_by_country(
         tfidf_q_addr = vectorizer_addr.transform(q_addrs)
         A_addr = tfidf_q_addr.tocsr()
         B_T_addr = tfidf_t_addr.transpose().tocsr()
-        sim_addr = sp_matmul_topn(A_addr, B_T_addr, top_n=top_k_each, n_threads=n_jobs)
+        del tfidf_t_addr, tfidf_q_addr, vectorizer_addr, t_addrs, q_addrs
+        gc.collect()
 
-        for i in range(sim_addr.shape[0]):
-            q_eid = q_eids[i]
-            if q_eid not in candidates:
-                candidates[q_eid] = set()
-            for ptr in range(sim_addr.indptr[i], sim_addr.indptr[i+1]):
-                if sim_addr.data[ptr] > 0:
-                    candidates[q_eid].add(t_eids[sim_addr.indices[ptr]])
+        for start_idx in range(0, A_addr.shape[0], batch_size):
+            end_idx = min(start_idx + batch_size, A_addr.shape[0])
+            A_batch = A_addr[start_idx:end_idx]
+            kwargs = {"top_n": top_k_each, "n_threads": n_jobs}
+            kwargs[thresh_arg] = 0.20
+            sim_addr = sp_matmul_topn(A_batch, B_T_addr, **kwargs)
 
-        del tfidf_t_addr, tfidf_q_addr, sim_addr, vectorizer_addr, A_addr, B_T_addr
+            for i in range(sim_addr.shape[0]):
+                q_eid = q_eids[start_idx + i]
+                if q_eid not in candidates:
+                    candidates[q_eid] = set()
+                for ptr in range(sim_addr.indptr[i], sim_addr.indptr[i+1]):
+                    if sim_addr.data[ptr] > 0:
+                        candidates[q_eid].add(t_eids[sim_addr.indices[ptr]])
+            del sim_addr, A_batch
+
+        del A_addr, B_T_addr
         gc.collect()
 
     return candidates
@@ -548,6 +572,11 @@ def run_blocking(split: str = "train",
         
     log.info(f"  Dense candidates: "
              f"{sum(len(v) for v in cands_dense.values()):,} pairs")
+
+    # Free cands_dense from RAM to give Strategy 3 16+ GB of headroom
+    del cands_dense
+    gc.collect()
+    log.info("  Freed dense candidates from RAM for TF-IDF stage.")
     log_memory()
 
     # ── Strategy 3: TF-IDF Split Name+Addr Blocking ─────────
@@ -563,6 +592,10 @@ def run_blocking(split: str = "train",
     log.info(f"  TF-IDF candidates: "
              f"{sum(len(v) for v in cands_tfidf.values()):,} pairs")
     log_memory()
+
+    # Reload dense candidates for merging
+    log.info("  Reloading dense candidates for merging...")
+    cands_dense = joblib.load(dense_cands_path)
 
     # ── Union all strategies with multi-engine voting ────────
     log.info("═══ Merging all blocking strategies via multi-engine voting ═══")
