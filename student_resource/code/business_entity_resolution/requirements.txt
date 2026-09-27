@@ -1,7 +1,6 @@
-# Python 3.12. Tested on Windows 11, RTX 4060 Laptop GPU (8 GB), 32 GB RAM.
-# Install the CUDA build of torch that matches your driver first, e.g.
-#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-torch==2.5.1
+# Python 3.12. Install CUDA torch first, then this file:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
 pandas==2.2.3
 numpy==2.2.1
 pyarrow==25.0.1
